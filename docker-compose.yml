@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cascade-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: cascade
+      POSTGRES_PASSWORD: cascade
+      POSTGRES_DB: cascade
+    volumes:
+      - cascade_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cascade -d cascade"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  cascade_pgdata:
