@@ -3,12 +3,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from cascade.db import engine
-from cascade.routes import health
+from cascade.db import engine, init_db
+from cascade.routes import health, pubsub, webhooks
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await init_db()
     yield
     await engine.dispose()
 
@@ -25,3 +26,5 @@ async def request_id(request, call_next):
 
 
 app.include_router(health.router)
+app.include_router(webhooks.router, prefix="/webhooks")
+app.include_router(pubsub.router, prefix="/pubsub")

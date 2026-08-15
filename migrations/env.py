@@ -18,6 +18,7 @@ if config.config_file_name is not None:
 
 from cascade.config import get_settings
 from cascade.db import Base
+from cascade import models  # noqa: F401 — registers ORM classes on Base.metadata
 
 target_metadata = Base.metadata
 
