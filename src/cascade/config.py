@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     pubsub_push_service_account: str
     pubsub_push_audience: str
     pubsub_card_events_topic: str = "card-events"
+    pubsub_job_completions_topic: str = "job-completions"
 
     trello_api_key: str
     trello_api_token: str

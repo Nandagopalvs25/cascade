@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -117,28 +118,34 @@ def test_wrong_target_list_is_noop(client, settings_override):
     assert _event_count() == 0
 
 
-def test_card_moved_to_todo_persists_event(client, settings_override, capsys):
+def test_card_moved_to_todo_persists_event(client, settings_override):
     body = json.dumps(
         _payload("action-5", "updateCard", settings_override.trello_list_todo)
     ).encode()
-    response = _post_signed(client, settings_override, body)
+
+    with patch("cascade.routes.webhooks.pubsub.publish") as mock_publish:
+        response = _post_signed(client, settings_override, body)
+
     assert response.status_code == 200
     assert _event_count() == 1
+    mock_publish.assert_awaited_once_with(
+        settings_override.pubsub_card_events_topic,
+        {"card_id": "card-abc", "action_id": "action-5", "kind": "card.moved_to_todo"},
+    )
 
-    captured = capsys.readouterr()
-    assert "card_id=card-abc" in captured.out
-    assert "action_id=action-5" in captured.out
 
-
-def test_card_created_in_todo_persists_event(client, settings_override, capsys):
+def test_card_created_in_todo_persists_event(client, settings_override):
     body = json.dumps(_create_card_payload("action-7", settings_override.trello_list_todo)).encode()
-    response = _post_signed(client, settings_override, body)
+
+    with patch("cascade.routes.webhooks.pubsub.publish") as mock_publish:
+        response = _post_signed(client, settings_override, body)
+
     assert response.status_code == 200
     assert _event_count() == 1
-
-    captured = capsys.readouterr()
-    assert "card_id=card-abc" in captured.out
-    assert "action_id=action-7" in captured.out
+    mock_publish.assert_awaited_once_with(
+        settings_override.pubsub_card_events_topic,
+        {"card_id": "card-abc", "action_id": "action-7", "kind": "card.created_in_todo"},
+    )
 
 
 def test_card_created_in_other_list_is_noop(client, settings_override):
@@ -155,8 +162,9 @@ def test_duplicate_action_id_is_not_reprocessed(client, settings_override):
         _payload("action-6", "updateCard", settings_override.trello_list_todo)
     ).encode()
 
-    first = _post_signed(client, settings_override, body)
-    second = _post_signed(client, settings_override, body)
+    with patch("cascade.routes.webhooks.pubsub.publish"):
+        first = _post_signed(client, settings_override, body)
+        second = _post_signed(client, settings_override, body)
 
     assert first.status_code == 200
     assert second.status_code == 200

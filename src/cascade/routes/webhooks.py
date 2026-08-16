@@ -3,7 +3,7 @@ import json
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import select
 
-from cascade.clients import trello
+from cascade.clients import pubsub, trello
 from cascade.dependencies import DbDep, SettingsDep
 from cascade.models import Event
 
@@ -53,9 +53,9 @@ async def trello_webhook(request: Request, db: DbDep, settings: SettingsDep):
     db.add(event)
     await db.commit()
 
-    print(
-        f"[trello] would publish to pubsub topic={settings.pubsub_card_events_topic}: "
-        f"card_id={data['card']['id']}, action_id={action_id}"
+    await pubsub.publish(
+        settings.pubsub_card_events_topic,
+        {"card_id": data["card"]["id"], "action_id": action_id, "kind": kind},
     )
 
     return Response(status_code=200)
