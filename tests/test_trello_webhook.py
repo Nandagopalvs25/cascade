@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from cascade.config import Settings, get_settings
 from cascade.db import get_db
 from cascade.main import app
-from cascade.models import Event
+from cascade.models import CardEvent
 
 
 def _sign(raw_body: bytes, callback_url: str, secret: str) -> str:
@@ -49,7 +49,7 @@ def _post_signed(client: TestClient, settings: Settings, body: bytes):
 def _event_count() -> int:
     async def _count(sessionmaker):
         async with sessionmaker() as session:
-            result = await session.execute(select(func.count()).select_from(Event))
+            result = await session.execute(select(func.count()).select_from(CardEvent))
             return result.scalar_one()
 
     from conftest import _test_sessionmaker

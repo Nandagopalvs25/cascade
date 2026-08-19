@@ -4,6 +4,12 @@ resource "google_project_iam_member" "cascade_run_cloudsql_client" {
   member  = "serviceAccount:${google_service_account.cascade_run.email}"
 }
 
+resource "google_project_iam_member" "cascade_run_aiplatform_user" {
+  project = var.project_id
+  role    = "roles/aiplatform.user"
+  member  = "serviceAccount:${google_service_account.cascade_run.email}"
+}
+
 resource "google_project_iam_member" "cascade_run_pubsub_publisher" {
   project = var.project_id
   role    = "roles/pubsub.publisher"

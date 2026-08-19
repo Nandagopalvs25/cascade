@@ -5,10 +5,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from cascade import models  # noqa: F401 — registers Run/Event on Base.metadata
 from cascade.config import Settings
 from cascade.db import Base
-
 
 TEST_DATABASE_URL = "postgresql+asyncpg://cascade:cascade@localhost:5432/cascade"
 
@@ -43,7 +41,7 @@ async def _create_all() -> None:
 
 async def _truncate_all() -> None:
     async with _test_engine.begin() as conn:
-        await conn.execute(text("truncate table events, runs cascade"))
+        await conn.execute(text("truncate table card_events, runs cascade"))
 
 
 async def _override_get_db():

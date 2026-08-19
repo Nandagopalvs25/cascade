@@ -3,6 +3,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from cascade.agents.runtime import build_campaign_runner
+from cascade.config import get_settings
 from cascade.db import engine, init_db
 from cascade.routes import health, pubsub, webhooks
 
@@ -10,6 +12,7 @@ from cascade.routes import health, pubsub, webhooks
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    app.state.runner = build_campaign_runner(get_settings())
     yield
     await engine.dispose()
 

@@ -7,6 +7,7 @@ locals {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "iam.googleapis.com",
+    "aiplatform.googleapis.com",
   ]
 }
 

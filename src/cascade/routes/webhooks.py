@@ -5,7 +5,7 @@ from sqlalchemy import select
 
 from cascade.clients import pubsub, trello
 from cascade.dependencies import DbDep, SettingsDep
-from cascade.models import Event
+from cascade.models import CardEvent
 
 router = APIRouter(tags=["trello"])
 
@@ -45,11 +45,11 @@ async def trello_webhook(request: Request, db: DbDep, settings: SettingsDep):
         return Response(status_code=200)
 
     action_id = action["id"]
-    existing = await db.execute(select(Event).where(Event.trello_action_id == action_id))
+    existing = await db.execute(select(CardEvent).where(CardEvent.trello_action_id == action_id))
     if existing.scalar_one_or_none():
         return Response(status_code=200)
 
-    event = Event(trello_action_id=action_id, kind=kind, payload=payload)
+    event = CardEvent(trello_action_id=action_id, kind=kind, payload=payload)
     db.add(event)
     await db.commit()
 

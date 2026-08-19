@@ -14,15 +14,26 @@ class TrelloClient:
         self._secret = api_secret
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
-            params={"key": api_key, "token": api_token},
-            headers={"X-Trello-Client-Identifier": "cascade-agent"},
+            headers={
+                "X-Trello-Client-Identifier": "cascade-agent",
+                "Authorization": self._oauth_header(api_key, api_token),
+            },
             timeout=10.0,
         )
+
+    @staticmethod
+    def _oauth_header(api_key: str, api_token: str) -> str:
+        return f'OAuth oauth_consumer_key="{api_key}", oauth_token="{api_token}"'
 
     async def create_card(self, list_id: str, name: str, desc: str) -> dict:
         resp = await self._client.post(
             "/cards", json={"idList": list_id, "name": name, "desc": desc}
         )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_card(self, card_id: str) -> dict:
+        resp = await self._client.get(f"/cards/{card_id}")
         resp.raise_for_status()
         return resp.json()
 
@@ -41,9 +52,7 @@ class TrelloClient:
         return resp.json()
 
     async def download_attachment(self, url: str) -> bytes:
-        headers = {
-            "Authorization": f'OAuth oauth_consumer_key="{self._key}", oauth_token="{self._token}"'
-        }
+        headers = {"Authorization": self._oauth_header(self._key, self._token)}
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()

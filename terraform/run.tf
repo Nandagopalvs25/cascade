@@ -2,6 +2,10 @@ resource "google_cloud_run_v2_service" "cascade" {
   name     = local.service_name
   location = var.region
 
+  scaling {
+    min_instance_count = 0
+  }
+
   template {
     service_account = google_service_account.cascade_run.email
 

@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     trello_list_needs_attention: str
     trello_list_done: str
 
+    gemini_model: str = "gemini-3.7-flash"
+    gemini_location: str = "global"
+    adk_user_id: str = "cascade"
+    max_llm_calls_per_invocation: int = 60
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

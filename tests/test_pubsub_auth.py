@@ -47,9 +47,9 @@ def test_accepts_valid_token(client, settings_override):
             "email_verified": True,
         }
         response = client.post(
-            "/pubsub/card-events",
-            json=_envelope({"card_id": "abc"}),
+            "/pubsub/job-completions",
+            json=_envelope({"run_id": "run-abc"}),
             headers={"Authorization": "Bearer fake-token"},
         )
     assert response.status_code == 200
-    assert response.json() == {"status": "accepted", "card_id": "abc"}
+    assert response.json() == {"status": "accepted", "run_id": "run-abc"}
