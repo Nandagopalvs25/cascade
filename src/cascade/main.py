@@ -5,13 +5,12 @@ from fastapi import FastAPI
 
 from cascade.agents.runtime import build_campaign_runner
 from cascade.config import get_settings
-from cascade.db import engine, init_db
+from cascade.db import engine
 from cascade.routes import health, pubsub, webhooks
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
     app.state.runner = build_campaign_runner(get_settings())
     yield
     await engine.dispose()
@@ -29,5 +28,5 @@ async def request_id(request, call_next):
 
 
 app.include_router(health.router)
-app.include_router(webhooks.router, prefix="/webhooks")
-app.include_router(pubsub.router, prefix="/pubsub")
+app.include_router(webhooks.router)
+app.include_router(pubsub.router)

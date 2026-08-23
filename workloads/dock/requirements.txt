@@ -1,0 +1,9 @@
+gemmi==0.7.5
+google-cloud-pubsub==2.39.1
+google-cloud-storage==3.13.1
+meeko==0.7.1
+numpy==2.5.2
+pydantic==2.13.4
+rdkit==2026.3.5
+scipy==1.18.0
+vina==1.2.7

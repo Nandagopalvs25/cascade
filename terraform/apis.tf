@@ -7,7 +7,10 @@ locals {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
     "aiplatform.googleapis.com",
+    "storage.googleapis.com",
+    "batch.googleapis.com",
   ]
 }
 

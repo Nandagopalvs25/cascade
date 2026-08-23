@@ -7,7 +7,7 @@ from cascade.clients import pubsub, trello
 from cascade.dependencies import DbDep, SettingsDep
 from cascade.models import CardEvent
 
-router = APIRouter(tags=["trello"])
+router = APIRouter(prefix="/webhooks", tags=["trello"])
 
 
 @router.head("/trello")

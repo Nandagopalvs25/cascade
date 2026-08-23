@@ -17,3 +17,15 @@ output "cascade_run_service_account" {
 output "cascade_pubsub_push_service_account" {
   value = google_service_account.cascade_pubsub_push.email
 }
+
+output "artifacts_bucket" {
+  value = google_storage_bucket.artifacts.name
+}
+
+output "dock_job_name" {
+  value = google_cloud_run_v2_job.dock.name
+}
+
+output "cascade_dock_service_account" {
+  value = google_service_account.cascade_dock.email
+}

@@ -21,7 +21,7 @@ resource "google_pubsub_subscription" "card_events_push" {
 
     oidc_token {
       service_account_email = google_service_account.cascade_pubsub_push.email
-      audience = "${local.cloud_run_url}/pubsub/card-events"
+      audience              = "${local.cloud_run_url}/pubsub/card-events"
     }
   }
 

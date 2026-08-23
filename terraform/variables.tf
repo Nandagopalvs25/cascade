@@ -53,3 +53,9 @@ variable "trello_list_needs_attention" {
 variable "trello_list_done" {
   type = string
 }
+
+variable "dock_image_digest" {
+  type        = string
+  description = "Digest of the docking workload image in the cascade Artifact Registry repo."
+  default     = "sha256:d8fa6b11a9239dde4847fab5027d2c1fe894e8b0465d6d0f9aae3c03ab7c256a"
+}

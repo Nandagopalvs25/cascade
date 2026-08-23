@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     database_url: str
 
     gcp_project_id: str
+    gcp_region: str = "us-central1"
+    gcs_bucket: str
     pubsub_push_service_account: str
     pubsub_push_audience: str
     pubsub_card_events_topic: str = "card-events"
@@ -30,6 +32,8 @@ class Settings(BaseSettings):
     gemini_location: str = "global"
     adk_user_id: str = "cascade"
     max_llm_calls_per_invocation: int = 60
+    max_ligands_per_cloud_run_job: int = 50
+    results_link_expiry_minutes: int = 10080
 
 
 @lru_cache(maxsize=1)

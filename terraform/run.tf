@@ -17,6 +17,14 @@ resource "google_cloud_run_v2_service" "cascade" {
         value = var.project_id
       }
       env {
+        name  = "CASCADE_GCP_REGION"
+        value = var.region
+      }
+      env {
+        name  = "CASCADE_GCS_BUCKET"
+        value = google_storage_bucket.artifacts.name
+      }
+      env {
         name  = "CASCADE_PUBSUB_PUSH_SERVICE_ACCOUNT"
         value = google_service_account.cascade_pubsub_push.email
       }
@@ -108,6 +116,7 @@ resource "google_cloud_run_v2_service" "cascade" {
     google_project_service.apis,
     google_secret_manager_secret_iam_member.cascade_run_access,
     google_project_iam_member.cascade_run_cloudsql_client,
+    google_storage_bucket_iam_member.cascade_run_object_admin,
   ]
 }
 

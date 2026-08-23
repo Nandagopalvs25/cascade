@@ -21,9 +21,17 @@ class Base(DeclarativeBase):
     pass
 
 
-async def init_db() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+ADK_MANAGED_TABLES = frozenset(
+    {"sessions", "events", "app_states", "user_states", "adk_internal_metadata"}
+)
+
+
+def exclude_adk_session_tables_from_autogenerate(
+    name: str | None, type_: str, parent_names: dict
+) -> bool:
+    if type_ == "table":
+        return name not in ADK_MANAGED_TABLES
+    return True
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

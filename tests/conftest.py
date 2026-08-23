@@ -19,6 +19,8 @@ def settings_override() -> Settings:
     return Settings(
         database_url=TEST_DATABASE_URL,
         gcp_project_id="test-project",
+        gcp_region="us-central1",
+        gcs_bucket="test-bucket",
         pubsub_push_service_account="cascade-pubsub-push@test-project.iam.gserviceaccount.com",
         pubsub_push_audience="https://cascade-test.run.app",
         trello_api_key="test-key",

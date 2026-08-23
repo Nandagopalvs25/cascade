@@ -2,6 +2,7 @@ import uuid
 from datetime import UTC, datetime
 
 from google.adk.agents.run_config import RunConfig
+from google.adk.flows.llm_flows.functions import REQUEST_INPUT_FUNCTION_CALL_NAME
 from google.adk.runners import Runner
 from google.adk.sessions import DatabaseSessionService
 from google.genai import types
@@ -9,9 +10,14 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cascade.agents.app import cascade_app
-from cascade.agents.schemas import CampaignOutcome, CardTrigger
+from cascade.agents.persistence import job_interrupt_id, load_pending_job_attempt_and_card
+from cascade.agents.schemas import CampaignOutcome, CardTrigger, JobOutcome
 from cascade.config import Settings
 from cascade.models import CardEvent
+
+
+def campaign_id_for_card(card_id: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cascade:card:{card_id}"))
 
 
 def build_campaign_runner(settings: Settings) -> Runner:
@@ -41,7 +47,7 @@ async def mark_card_event_processed(db: AsyncSession, action_id: str) -> None:
 async def start_campaign_for_card(
     runner: Runner, settings: Settings, db: AsyncSession, card_id: str, action_id: str
 ) -> CampaignOutcome | None:
-    campaign_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"cascade:card:{card_id}"))
+    campaign_id = campaign_id_for_card(card_id)
 
     if await card_event_already_processed(db, action_id):
         return CampaignOutcome(
@@ -76,3 +82,34 @@ async def start_campaign_for_card(
 
     await mark_card_event_processed(db, action_id)
     return outcome
+
+
+async def resume_campaign_on_job_completion(
+    runner: Runner, settings: Settings, db: AsyncSession, completion: dict
+) -> str:
+    run_id = completion["run_id"]
+    pending = await load_pending_job_attempt_and_card(db, run_id)
+    if pending is None:
+        return "ignored"
+
+    attempt, card_id = pending
+    outcome = JobOutcome.model_validate(completion)
+    async for _ in runner.run_async(
+        user_id=settings.adk_user_id,
+        session_id=campaign_id_for_card(card_id),
+        new_message=types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=job_interrupt_id(run_id, attempt),
+                        name=REQUEST_INPUT_FUNCTION_CALL_NAME,
+                        response=outcome.model_dump(exclude_none=True),
+                    )
+                )
+            ],
+        ),
+        run_config=RunConfig(max_llm_calls=settings.max_llm_calls_per_invocation),
+    ):
+        pass
+    return "resumed"

@@ -1,17 +1,21 @@
 import base64
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from cascade.config import get_settings
+from cascade.db import get_db
+from cascade.dependencies import get_runner
 from cascade.main import app
 
 
 @pytest.fixture
-def client(settings_override):
+def client(settings_override, db_session_override):
     app.dependency_overrides[get_settings] = lambda: settings_override
+    app.dependency_overrides[get_db] = db_session_override
+    app.dependency_overrides[get_runner] = lambda: AsyncMock()
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -41,6 +45,7 @@ def test_rejects_wrong_service_account(client, settings_override):
 
 
 def test_accepts_valid_token(client, settings_override):
+    run_id = "0f9d4a2e-5c3b-5f7a-9c1d-2b6e8a4f7c31"
     with patch("cascade.security.id_token.verify_oauth2_token") as mock_verify:
         mock_verify.return_value = {
             "email": settings_override.pubsub_push_service_account,
@@ -48,8 +53,8 @@ def test_accepts_valid_token(client, settings_override):
         }
         response = client.post(
             "/pubsub/job-completions",
-            json=_envelope({"run_id": "run-abc"}),
+            json=_envelope({"run_id": run_id}),
             headers={"Authorization": "Bearer fake-token"},
         )
     assert response.status_code == 200
-    assert response.json() == {"status": "accepted", "run_id": "run-abc"}
+    assert response.json() == {"status": "ignored", "run_id": run_id}
