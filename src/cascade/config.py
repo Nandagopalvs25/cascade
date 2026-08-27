@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     max_llm_calls_per_invocation: int = 60
     max_ligands_per_cloud_run_job: int = 50
     results_link_expiry_minutes: int = 10080
+    control_rmsd_threshold_angstrom: float = 2.0
+    control_rerun_conformers_per_ligand: int = 8
+    max_job_attempts: int = 2
 
 
 @lru_cache(maxsize=1)

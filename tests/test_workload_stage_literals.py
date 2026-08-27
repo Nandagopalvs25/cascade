@@ -9,7 +9,7 @@ from cascade.agents.prompts import INTAKE_INSTRUCTION
 from cascade.agents.schemas import CampaignIntent, Stage
 from cascade.schemas import JobSpec, TargetStructure, Workload
 
-EXECUTABLE_WORKLOADS = ("dock", "admet", "md_stability", "fold_affinity")
+EXECUTABLE_WORKLOADS = ("dock", "admet", "md_stability", "cofold")
 
 
 def test_workload_covers_every_container_in_the_workloads_directory():
@@ -71,11 +71,11 @@ def test_retired_stage_spellings_are_rejected(retired_name):
 
 def test_campaign_intent_requests_only_executable_workloads():
     intent = CampaignIntent(
-        requested_stages=["dock", "fold_affinity"],
+        requested_stages=["dock", "cofold"],
         rationale="dock then co-fold the survivors",
     )
 
-    assert intent.requested_stages == ["dock", "fold_affinity"]
+    assert intent.requested_stages == ["dock", "cofold"]
 
     with pytest.raises(ValueError):
         CampaignIntent(requested_stages=["synthesis"], rationale="test")
@@ -94,3 +94,39 @@ def test_intake_prompt_does_not_offer_the_retired_fold_stage():
     assert not re.search(r"\bfold\b", INTAKE_INSTRUCTION), (
         "prompt offers bare 'fold'; CampaignIntent.requested_stages would reject it"
     )
+
+
+def _objects_without_declared_properties(schema, path=""):
+    from google.genai import types
+
+    offenders = []
+    if schema.type == types.Type.OBJECT and not schema.properties:
+        offenders.append(path or "<root>")
+    for name, child in (schema.properties or {}).items():
+        offenders.extend(
+            _objects_without_declared_properties(child, f"{path}.{name}" if path else name)
+        )
+    if schema.items:
+        offenders.extend(_objects_without_declared_properties(schema.items, f"{path}[]"))
+    return offenders
+
+
+@pytest.mark.parametrize("agent_name", ("intake", "planner", "triage", "proposer"))
+def test_agent_output_schemas_declare_every_object_property(agent_name):
+    from google.genai import _transformers
+
+    from cascade.agents import definitions
+
+    agent = getattr(definitions, f"{agent_name}_agent")
+    schema = _transformers.t_schema(None, agent.output_schema)
+
+    assert _objects_without_declared_properties(schema) == []
+
+
+def test_planner_can_emit_every_parameter_the_instruction_describes():
+    from cascade.agents.policy import ALLOWED_JOB_PARAMS_BY_WORKLOAD
+    from cascade.agents.schemas import WorkloadParams
+
+    allowed = set().union(*ALLOWED_JOB_PARAMS_BY_WORKLOAD.values())
+
+    assert set(WorkloadParams.model_fields) <= allowed

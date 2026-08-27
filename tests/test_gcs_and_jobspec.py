@@ -246,6 +246,21 @@ def test_download_json_from_uri_reads_the_bucket_named_in_the_uri(gcs_client_wit
     other_bucket.blob.assert_called_once_with("runs/run-9/spec.json")
 
 
+def test_download_text_from_uri_reads_the_bucket_named_in_the_uri(gcs_client_with_mock_bucket):
+    client, _ = gcs_client_with_mock_bucket
+    other_bucket = MagicMock()
+    other_bucket.blob.return_value.download_as_text.return_value = "CC(C)Cc1ccc(cc1)\tibuprofen\n"
+    client._client.bucket.return_value = other_bucket
+
+    result = asyncio.run(
+        client.download_text_from_uri("gs://other-bucket/runs/run-9/inputs/ligands.smi")
+    )
+
+    assert result == "CC(C)Cc1ccc(cc1)\tibuprofen\n"
+    client._client.bucket.assert_called_with("other-bucket")
+    other_bucket.blob.assert_called_once_with("runs/run-9/inputs/ligands.smi")
+
+
 def test_generate_signed_url_requests_a_v4_get_url(gcs_client_with_mock_bucket):
     client, bucket = gcs_client_with_mock_bucket
     bucket.blob.return_value.generate_signed_url.return_value = "https://signed.example/x"

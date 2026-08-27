@@ -15,11 +15,13 @@ from docking import (
 )
 from job_spec import DockingParams, JobSpec
 from ligands import (
+    LigandFailure,
     LigandRecord,
     canonical_smiles,
     load_ligand_library,
     molecule_from_pdb_block_with_template,
     prepare_ligand_library,
+    records_protonated_at_ph,
 )
 from results import (
     RESULTS_ARCHIVE_NAME,
@@ -292,15 +294,28 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
             f"{len(records)} compounds exceeds the {params.max_ligands} compound ceiling for a "
             "single docking job"
         )
-    prepared, preparation_failures = prepare_ligand_library(records, seed=params.seed)
+    protonation_failures: list[LigandFailure] = []
+    if params.ligand_ph is not None:
+        records, protonation_failures = records_protonated_at_ph(records, params.ligand_ph)
+        LOGGER.info(
+            "run %s: protonated %s compounds at pH %s, %s unusable",
+            spec.run_id,
+            len(records),
+            params.ligand_ph,
+            len(protonation_failures),
+        )
+    prepared, preparation_failures = prepare_ligand_library(
+        records, seed=params.seed, conformers_per_ligand=params.conformers_per_ligand
+    )
     if not prepared:
         raise ValueError(f"no compounds in {spec.ligands_uri} could be prepared for docking")
     LOGGER.info(
-        "run %s: prepared %s of %s compounds, %s unusable",
+        "run %s: prepared %s conformers of %s compounds at %s per compound, %s unusable",
         spec.run_id,
         len(prepared),
         len(records) + len(load_failures),
-        len(load_failures) + len(preparation_failures),
+        params.conformers_per_ligand,
+        len(load_failures) + len(protonation_failures) + len(preparation_failures),
     )
 
     results, docking_failures = dock_prepared_ligands(
@@ -308,7 +323,12 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
     )
     if not results:
         raise ValueError("every compound failed to dock")
-    failures = [*load_failures, *preparation_failures, *docking_failures]
+    failures = [
+        *load_failures,
+        *protonation_failures,
+        *preparation_failures,
+        *docking_failures,
+    ]
     LOGGER.info("run %s: docked %s compounds", spec.run_id, len(results))
 
     control = measure_control_compound(spec, records, results, cocrystal_ligand)
@@ -339,6 +359,16 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
     results_archive_uri = store.upload_file(archive_path, f"{output_prefix}/{RESULTS_ARCHIVE_NAME}")
 
     best = summary["scores"][0]
+    analysis = summary["score_analysis"] or {}
+    LOGGER.info(
+        "run %s: score analysis separates_best=%s size_driven=%s correlation=%s "
+        "indistinguishable=%s",
+        spec.run_id,
+        analysis.get("ranking_separates_best_compound"),
+        analysis.get("ranking_is_size_driven"),
+        analysis.get("affinity_heavy_atom_correlation"),
+        len(analysis.get("compounds_indistinguishable_from_best", [])),
+    )
     return {
         "run_id": spec.run_id,
         "workload": spec.workload,
@@ -354,6 +384,20 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
             "best_affinity_kcal_per_mol": best["best_affinity_kcal_per_mol"],
             "binding_site_origin": site.origin,
             "control_compound": summary["control_compound"],
+            "score_analysis": {
+                "scoring_function_error_kcal_per_mol": analysis.get(
+                    "scoring_function_error_kcal_per_mol"
+                ),
+                "ranking_separates_best_compound": analysis.get("ranking_separates_best_compound"),
+                "compounds_indistinguishable_from_best_count": len(
+                    analysis.get("compounds_indistinguishable_from_best", [])
+                ),
+                "ranking_is_size_driven": analysis.get("ranking_is_size_driven"),
+                "affinity_heavy_atom_correlation": analysis.get("affinity_heavy_atom_correlation"),
+                "metrics_agree_on_best_compound": analysis.get("metrics_agree_on_best_compound"),
+                "best_by_ligand_efficiency": analysis.get("best_by_ligand_efficiency"),
+                "control_affinity_rank": analysis.get("control_affinity_rank"),
+            },
         },
     }
 

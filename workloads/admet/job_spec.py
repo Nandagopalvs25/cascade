@@ -16,14 +16,6 @@ class BindingSite(BaseModel):
     size_y: float = 20.0
     size_z: float = 20.0
 
-    @property
-    def center(self) -> list[float]:
-        return [self.center_x, self.center_y, self.center_z]
-
-    @property
-    def box_size(self) -> list[float]:
-        return [self.size_x, self.size_y, self.size_z]
-
 
 class TargetStructure(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -48,20 +40,15 @@ class JobSpec(BaseModel):
     control_compound: str | None = None
 
 
-class DockingParams(BaseModel):
+class AdmetParams(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    exhaustiveness: int = Field(default=8, ge=1, le=512)
-    num_modes: int = Field(default=9, ge=1, le=50)
-    seed: int = 42
-    cpu: int = Field(default=0, ge=0)
-    receptor_ph: float = Field(default=7.4, ge=0.0, le=14.0)
-    ligand_ph: float | None = Field(default=7.4, ge=0.0, le=14.0)
-    conformers_per_ligand: int = Field(default=4, ge=1, le=32)
-    binding_site_padding: float = Field(default=5.0, ge=0.0, le=20.0)
-    max_ligands: int = Field(default=500, ge=1)
-    scoring_function_error_kcal_per_mol: float = Field(default=2.0, gt=0.0, le=10.0)
+    max_compounds: int = Field(default=2000, ge=1)
+    herg_logp_threshold: float = Field(default=3.7, ge=0.0)
+    herg_minimum_aromatic_rings: int = Field(default=2, ge=0)
+    brenk_alerts_that_fail: int = Field(default=3, ge=1)
+    lipinski_violations_that_fail: int = Field(default=2, ge=1)
 
     @classmethod
-    def from_job_spec(cls, spec: JobSpec) -> "DockingParams":
+    def from_job_spec(cls, spec: JobSpec) -> "AdmetParams":
         return cls.model_validate(spec.params)

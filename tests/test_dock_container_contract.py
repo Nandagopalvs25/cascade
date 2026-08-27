@@ -12,11 +12,14 @@ sys.path.insert(0, str(DOCK_CONTAINER_DIRECTORY))
 from job_spec import DockingParams  # noqa: E402
 from job_spec import JobSpec as ContainerJobSpec  # noqa: E402
 from structure import (  # noqa: E402
+    MINIMUM_LIGAND_HEAVY_ATOMS,
+    STRUCTURAL_METAL_RESIDUE_NAMES,
     binding_site_from_atoms,
     extract_protein_receptor_pdb,
     find_cocrystal_ligands,
     receptor_atom_count,
     receptor_chain_ids,
+    receptor_metal_labels,
 )
 
 
@@ -156,6 +159,58 @@ def test_receptor_extraction_keeps_protein_and_drops_everything_else(structure_p
     assert "GOL" not in receptor
     assert "SER" not in receptor
     assert " Z " not in receptor
+
+
+def test_docking_params_protonate_ligands_at_physiological_ph_by_default():
+    params = DockingParams()
+
+    assert params.ligand_ph == 7.4
+    assert params.receptor_ph == 7.4
+
+
+def test_ligand_protonation_can_be_turned_off_without_touching_the_receptor():
+    params = DockingParams.model_validate({"ligand_ph": None})
+
+    assert params.ligand_ph is None
+    assert params.receptor_ph == 7.4
+
+
+def test_receptor_extraction_keeps_a_catalytic_metal_with_the_protein(structure_pdb_text):
+    with_zinc = structure_pdb_text.replace(
+        "ENDMDL",
+        pdb_atom_line("HETATM", 900, "ZN", "ZN", "A", 500, 1.0, 1.0, 1.0, "ZN") + "\nENDMDL",
+        1,
+    )
+
+    receptor = extract_protein_receptor_pdb(with_zinc)
+
+    assert receptor_metal_labels(receptor) == ["ZN:A:500"]
+    assert receptor_atom_count(receptor) == 9
+    assert "GOL" not in receptor
+    assert "HOH" not in receptor
+    assert "LIG" not in receptor
+
+
+def test_a_metal_is_never_small_enough_to_be_mistaken_for_the_cocrystal_ligand(
+    structure_pdb_text,
+):
+    with_zinc = structure_pdb_text.replace(
+        "ENDMDL",
+        pdb_atom_line("HETATM", 900, "ZN", "ZN", "A", 500, 1.0, 1.0, 1.0, "ZN") + "\nENDMDL",
+        1,
+    )
+
+    ligands = find_cocrystal_ligands(with_zinc)
+
+    assert [ligand.label for ligand in ligands] == ["LIG:B:902"]
+
+
+def test_every_allowlisted_metal_stays_below_the_cocrystal_ligand_atom_floor():
+    assert MINIMUM_LIGAND_HEAVY_ATOMS > 4
+    assert "HEM" not in STRUCTURAL_METAL_RESIDUE_NAMES
+    assert "NAD" not in STRUCTURAL_METAL_RESIDUE_NAMES
+    assert "ATP" not in STRUCTURAL_METAL_RESIDUE_NAMES
+    assert "ZN" in STRUCTURAL_METAL_RESIDUE_NAMES
 
 
 def test_receptor_extraction_honours_the_requested_chain(structure_pdb_text):

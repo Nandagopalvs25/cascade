@@ -233,7 +233,7 @@ def test_unreachable_target_url_surfaces_the_http_error(settings_override):
     ],
 )
 def test_prose_lines_are_not_mistaken_for_compounds(line):
-    from cascade.agents.nodes import smiles_library_lines_from_text
+    from cascade.agents.compound_library import smiles_library_lines_from_text
 
     kept, skipped = smiles_library_lines_from_text(line)
     assert kept == []
@@ -253,7 +253,7 @@ def test_prose_lines_are_not_mistaken_for_compounds(line):
     ],
 )
 def test_real_smiles_survive_the_filter(smiles):
-    from cascade.agents.nodes import smiles_library_lines_from_text
+    from cascade.agents.compound_library import smiles_library_lines_from_text
 
     kept, skipped = smiles_library_lines_from_text(f"{smiles} compound")
     assert kept == [f"{smiles}\tcompound"]

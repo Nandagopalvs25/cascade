@@ -1,5 +1,8 @@
 import csv
 import io
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +12,9 @@ from rdkit.Chem import AllChem
 from rdkit.Chem.AllChem import AssignBondOrdersFromTemplate
 
 RDLogger.DisableLog("rdApp.*")
+
+OPENBABEL_EXECUTABLE = "obabel"
+OPENBABEL_PROTONATION_TIMEOUT_SECONDS = 600
 
 SDF_SUFFIXES = frozenset({".sdf", ".sd", ".mol"})
 SMILES_SUFFIXES = frozenset({".smi", ".smiles", ".txt"})
@@ -140,6 +146,65 @@ def load_ligand_library(path: str | Path) -> tuple[list[LigandRecord], list[Liga
     raise ValueError(f"unsupported ligand library format: {library_path.name}")
 
 
+def smiles_protonated_at_ph(smiles_by_name: dict[str, str], ph: float) -> dict[str, str]:
+    executable = shutil.which(OPENBABEL_EXECUTABLE)
+    if executable is None:
+        raise LigandPreparationError(f"{OPENBABEL_EXECUTABLE} is not available in this image")
+
+    with tempfile.TemporaryDirectory(prefix="cascade-protonate-") as directory:
+        source = Path(directory) / "ligands.smi"
+        source.write_text("".join(f"{smiles}\t{name}\n" for name, smiles in smiles_by_name.items()))
+        completed = subprocess.run(
+            [executable, str(source), "-osmi", "-p", f"{ph}"],
+            capture_output=True,
+            text=True,
+            timeout=OPENBABEL_PROTONATION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise LigandPreparationError(
+            f"openbabel could not protonate the library: {completed.stderr.strip()[-500:]}"
+        )
+
+    protonated: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split("\t")
+        if len(fields) < 2 or not fields[0]:
+            continue
+        protonated[fields[1].strip()] = fields[0].strip()
+    return protonated
+
+
+def records_protonated_at_ph(
+    records: list[LigandRecord], ph: float
+) -> tuple[list[LigandRecord], list[LigandFailure]]:
+    embeddable = {
+        record.name: canonical_smiles(record.mol)
+        for record in records
+        if not has_three_dimensional_conformer(record.mol)
+    }
+    if not embeddable:
+        return records, []
+
+    protonated_smiles = smiles_protonated_at_ph(embeddable, ph)
+    adjusted: list[LigandRecord] = []
+    failures: list[LigandFailure] = []
+    for record in records:
+        smiles = protonated_smiles.get(record.name)
+        if smiles is None:
+            adjusted.append(record)
+            continue
+        mol, reason = _molecule_from_smiles(smiles)
+        if mol is None:
+            failures.append(
+                LigandFailure(name=record.name, reason=f"protonated form unusable: {reason}")
+            )
+            continue
+        mol.SetProp("_Name", record.name)
+        adjusted.append(LigandRecord(name=record.name, mol=mol))
+    return adjusted, failures
+
+
 def has_three_dimensional_conformer(mol: Chem.Mol) -> bool:
     return mol.GetNumConformers() > 0 and mol.GetConformer().Is3D()
 
@@ -177,16 +242,36 @@ def prepare_ligand_for_docking(record: LigandRecord, seed: int = 42) -> Prepared
     return PreparedLigand(name=record.name, pdbqt=ligand_pdbqt_string(mol), mol=mol)
 
 
+def conformer_seeds_for_record(
+    record: LigandRecord, seed: int, conformers_per_ligand: int
+) -> list[int]:
+    if has_three_dimensional_conformer(record.mol):
+        return [seed]
+    return [seed + offset for offset in range(conformers_per_ligand)]
+
+
 def prepare_ligand_library(
-    records: list[LigandRecord], seed: int = 42
+    records: list[LigandRecord], seed: int = 42, conformers_per_ligand: int = 1
 ) -> tuple[list[PreparedLigand], list[LigandFailure]]:
     prepared: list[PreparedLigand] = []
     failures: list[LigandFailure] = []
     for record in records:
-        try:
-            prepared.append(prepare_ligand_for_docking(record, seed=seed))
-        except Exception as error:
-            failures.append(LigandFailure(name=record.name, reason=str(error)))
+        conformers: list[PreparedLigand] = []
+        reasons: list[str] = []
+        for conformer_seed in conformer_seeds_for_record(record, seed, conformers_per_ligand):
+            try:
+                conformers.append(prepare_ligand_for_docking(record, seed=conformer_seed))
+            except Exception as error:
+                reasons.append(str(error))
+        if conformers:
+            prepared.extend(conformers)
+            continue
+        failures.append(
+            LigandFailure(
+                name=record.name,
+                reason=reasons[0] if reasons else "no conformer could be prepared",
+            )
+        )
     return prepared, failures
 
 

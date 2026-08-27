@@ -2,12 +2,18 @@ import csv
 import json
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from docking import LigandDockingResult
 from job_spec import BindingSite, DockingParams, JobSpec
 from ligands import LigandFailure
+from score_analysis import (
+    ScoredCompound,
+    analyze_docking_scores,
+    ligand_efficiency,
+    size_independent_ligand_efficiency,
+)
 
 SCORES_FILE_NAME = "scores.csv"
 RESULTS_FILE_NAME = "results.json"
@@ -66,6 +72,9 @@ def write_scores_csv(results: list[LigandDockingResult], directory: Path) -> Pat
                 "rank",
                 "compound_id",
                 "best_affinity_kcal_per_mol",
+                "heavy_atom_count",
+                "ligand_efficiency",
+                "size_independent_ligand_efficiency",
                 "mode_count",
                 "mode_affinity_spread",
                 "pose_file",
@@ -77,6 +86,11 @@ def write_scores_csv(results: list[LigandDockingResult], directory: Path) -> Pat
                     rank,
                     result.name,
                     f"{result.best_affinity:.3f}",
+                    result.heavy_atom_count,
+                    ligand_efficiency(result.best_affinity, result.heavy_atom_count),
+                    size_independent_ligand_efficiency(
+                        result.best_affinity, result.heavy_atom_count
+                    ),
                     result.mode_count,
                     f"{result.mode_affinity_spread:.3f}",
                     pose_file_relative_path(rank, result.name),
@@ -98,6 +112,26 @@ def write_reference_ligand_pdb(pdb_block: str, directory: Path) -> Path:
     destination = directory / REFERENCE_LIGAND_FILE_NAME
     destination.write_text(pdb_block)
     return destination
+
+
+def score_analysis_for_results(
+    results: list[LigandDockingResult],
+    params: DockingParams,
+    control: ControlCompoundSummary,
+) -> dict | None:
+    analysis = analyze_docking_scores(
+        [
+            ScoredCompound(
+                name=result.name,
+                best_affinity=result.best_affinity,
+                heavy_atom_count=result.heavy_atom_count,
+            )
+            for result in results
+        ],
+        control_compound_name=control.requested_name,
+        scoring_function_error_kcal_per_mol=params.scoring_function_error_kcal_per_mol,
+    )
+    return asdict(analysis) if analysis is not None else None
 
 
 def build_run_summary(
@@ -150,11 +184,19 @@ def build_run_summary(
                 "rank": rank,
                 "compound_id": result.name,
                 "best_affinity_kcal_per_mol": result.best_affinity,
+                "heavy_atom_count": result.heavy_atom_count,
+                "ligand_efficiency": ligand_efficiency(
+                    result.best_affinity, result.heavy_atom_count
+                ),
+                "size_independent_ligand_efficiency": size_independent_ligand_efficiency(
+                    result.best_affinity, result.heavy_atom_count
+                ),
                 "mode_affinities": result.mode_affinities,
                 "mode_affinity_spread": result.mode_affinity_spread,
             }
             for rank, result in enumerate(ranked, start=1)
         ],
+        "score_analysis": score_analysis_for_results(results, params, control),
     }
 
 

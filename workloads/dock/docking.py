@@ -28,6 +28,7 @@ class LigandDockingResult:
     name: str
     mode_affinities: list[float] = field(default_factory=list)
     poses_pdbqt: str = ""
+    heavy_atom_count: int = 0
 
     @property
     def best_affinity(self) -> float:
@@ -113,8 +114,8 @@ def dock_prepared_ligands(
     engine.set_receptor(str(receptor_pdbqt_path))
     engine.compute_vina_maps(center=binding_site.center, box_size=binding_site.box_size)
 
-    results: list[LigandDockingResult] = []
-    failures: list[LigandFailure] = []
+    best_by_name: dict[str, LigandDockingResult] = {}
+    reason_by_name: dict[str, str] = {}
     for ligand in prepared_ligands:
         try:
             engine.set_ligand_from_string(ligand.pdbqt)
@@ -122,20 +123,25 @@ def dock_prepared_ligands(
             energies = engine.energies(n_poses=params.num_modes)
             mode_affinities = [round(float(row[0]), 3) for row in energies]
             if not mode_affinities:
-                failures.append(
-                    LigandFailure(name=ligand.name, reason="docking returned no scored pose")
-                )
+                reason_by_name.setdefault(ligand.name, "docking returned no scored pose")
                 continue
-            results.append(
-                LigandDockingResult(
-                    name=ligand.name,
-                    mode_affinities=mode_affinities,
-                    poses_pdbqt=engine.poses(n_poses=params.num_modes),
-                )
+            candidate = LigandDockingResult(
+                name=ligand.name,
+                mode_affinities=mode_affinities,
+                poses_pdbqt=engine.poses(n_poses=params.num_modes),
+                heavy_atom_count=ligand.mol.GetNumHeavyAtoms(),
             )
+            incumbent = best_by_name.get(ligand.name)
+            if incumbent is None or candidate.best_affinity < incumbent.best_affinity:
+                best_by_name[ligand.name] = candidate
         except Exception as error:
-            failures.append(LigandFailure(name=ligand.name, reason=f"docking failed: {error}"))
-    return results, failures
+            reason_by_name.setdefault(ligand.name, f"docking failed: {error}")
+    failures = [
+        LigandFailure(name=name, reason=reason)
+        for name, reason in reason_by_name.items()
+        if name not in best_by_name
+    ]
+    return list(best_by_name.values()), failures
 
 
 def molecule_from_pose_pdbqt(pose_pdbqt: str) -> Chem.Mol:

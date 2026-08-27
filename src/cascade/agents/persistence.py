@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cascade.db import async_session
-from cascade.models import Artifact, Job, JobState, Run, RunState
+from cascade.models import Artifact, Decision, Job, JobState, Run, RunState
 from cascade.schemas import JobSpec
 
 
@@ -13,16 +13,34 @@ def job_interrupt_id(run_id: str, attempt: int) -> str:
     return f"job:{run_id}:{attempt}"
 
 
+def parsed_run_uuid(run_id: str | None) -> uuid.UUID | None:
+    if not run_id:
+        return None
+    try:
+        return uuid.UUID(run_id)
+    except ValueError:
+        return None
+
+
 async def record_run_and_reserve_job_attempt(
-    run_id: str, card_id: str, spec: JobSpec, executor: str, attempt: int
+    run_id: str,
+    card_id: str,
+    spec: JobSpec,
+    executor: str,
+    attempt: int,
+    parent_run_id: str | None = None,
 ) -> str | None:
     run_uuid = uuid.UUID(run_id)
     async with async_session() as session:
         run = await session.get(Run, run_uuid)
         if run is None:
+            parent_uuid = parsed_run_uuid(parent_run_id)
+            if parent_uuid is not None and await session.get(Run, parent_uuid) is None:
+                parent_uuid = None
             session.add(
                 Run(
                     id=run_uuid,
+                    parent_run_id=parent_uuid,
                     trello_card_id=card_id,
                     workload=spec.workload,
                     state=RunState.queued,
@@ -120,3 +138,43 @@ async def record_job_completion(
 
         await session.commit()
         return recorded
+
+
+async def record_decision(
+    run_id: str, agent: str, decision_kind: str, rationale: str, inputs: dict, output: dict
+) -> None:
+    try:
+        run_uuid = uuid.UUID(run_id)
+    except ValueError:
+        return
+    async with async_session() as session:
+        if await session.get(Run, run_uuid) is None:
+            return
+        session.add(
+            Decision(
+                run_id=run_uuid,
+                agent=agent,
+                decision_kind=decision_kind,
+                rationale=rationale,
+                inputs=inputs,
+                output=output,
+            )
+        )
+        await session.commit()
+
+
+async def workloads_already_run_in_lineage(run_id: str) -> dict[str, str]:
+    run_uuid = parsed_run_uuid(run_id)
+    if run_uuid is None:
+        return {}
+    already_run: dict[str, str] = {}
+    visited: set[uuid.UUID] = set()
+    async with async_session() as session:
+        while run_uuid is not None and run_uuid not in visited:
+            visited.add(run_uuid)
+            run = await session.get(Run, run_uuid)
+            if run is None:
+                break
+            already_run.setdefault(run.workload, str(run.id))
+            run_uuid = run.parent_run_id
+    return already_run

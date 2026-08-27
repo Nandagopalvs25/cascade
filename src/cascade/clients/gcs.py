@@ -101,6 +101,15 @@ class GCSClient:
 
         return await asyncio.to_thread(download_json_blob_from_bucket)
 
+    async def download_text_from_uri(self, uri: str) -> str:
+        bucket_name, object_path = split_gcs_uri(uri)
+
+        def download_text_blob_from_bucket() -> str:
+            blob = self._client.bucket(bucket_name).blob(object_path)
+            return blob.download_as_text()
+
+        return await asyncio.to_thread(download_text_blob_from_bucket)
+
     def _resolve_iam_signing_identity(self) -> tuple[str, str] | None:
         with self._signing_credentials_lock:
             if self._signing_credentials is None:

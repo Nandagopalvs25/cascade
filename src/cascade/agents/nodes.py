@@ -1,7 +1,4 @@
-import re
-import uuid
 from collections.abc import AsyncGenerator
-from pathlib import PurePosixPath
 
 import httpx
 from google.adk.agents.context import Context
@@ -10,19 +7,53 @@ from google.adk.workflow import RetryConfig, node
 from google.api_core import exceptions as google_api_exceptions
 from google.auth.exceptions import GoogleAuthError
 
+from cascade.agents.card_text import (
+    agent_prose_without_runaway_text,
+    blocked_stages_note,
+    control_compound_line,
+    followup_card_comment,
+    job_outcome_headline,
+    library_lines_for_compounds,
+    planner_decision_lines,
+    proposed_card_description,
+    skipped_lines_note,
+    triage_card_comment,
+)
+from cascade.agents.compound_library import (
+    DEFAULT_LIGAND_FILENAME,
+    compound_count_in_library,
+    compound_names_from_library_lines,
+    ligand_filename_for_reference,
+    smiles_library_lines_from_text,
+)
 from cascade.agents.persistence import (
     attach_execution_name_to_job,
     job_interrupt_id,
     load_succeeded_run_for_card,
+    record_decision,
     record_job_completion,
     record_run_and_reserve_job_attempt,
+    workloads_already_run_in_lineage,
+)
+from cascade.agents.policy import (
+    allowed_job_params_for_workload,
+    attempts_remaining_after,
+    compound_records_from_manifest,
+    compounds_carried_to_next_stage,
+    control_check_for_job,
+    enforce_control_gate,
+    hold_every_scored_compound_when_triage_judged_none,
+    next_stage_options,
 )
 from cascade.agents.schemas import (
+    BlockedStage,
+    CampaignCompletion,
     CampaignIntent,
     CampaignOutcome,
     CampaignState,
     CardInputs,
     CardTrigger,
+    CompletedStage,
     IntakeAnnouncement,
     JobLaunch,
     JobOutcome,
@@ -30,7 +61,13 @@ from cascade.agents.schemas import (
     JobSubmission,
     LigandLibrary,
     LigandRequest,
+    ProposalDecision,
+    ProposalRequest,
+    ProposedFollowup,
     StageOutcome,
+    TriageDecision,
+    TriagedJobResult,
+    TriageRequest,
     UnsupportedExecutor,
 )
 from cascade.clients import campaign_inputs, cloud_run_jobs, gcs, trello
@@ -47,6 +84,22 @@ from cascade.schemas import JobSpec, TargetRequest, TargetStructure
 settings = get_settings()
 
 FETCH_RETRY = RetryConfig(max_attempts=3, backoff_factor=2.0, exceptions=[httpx.HTTPError])
+SUBMIT_RETRY = RetryConfig(
+    max_attempts=3, backoff_factor=2.0, exceptions=[google_api_exceptions.ServerError]
+)
+MANIFEST_READ_FAILURES = (
+    google_api_exceptions.GoogleAPICallError,
+    GoogleAuthError,
+    ValueError,
+    OSError,
+)
+SIGNING_FAILURES = (AttributeError, GoogleAuthError, google_api_exceptions.GoogleAPICallError)
+
+
+settings = get_settings()
+
+FETCH_RETRY = RetryConfig(max_attempts=3, backoff_factor=2.0, exceptions=[httpx.HTTPError])
+
 SUBMIT_RETRY = RetryConfig(
     max_attempts=3, backoff_factor=2.0, exceptions=[google_api_exceptions.ServerError]
 )
@@ -94,22 +147,6 @@ async def ask_scientist_for_clarification(
     return intent
 
 
-LIGAND_SUFFIXES = frozenset({".sdf", ".sd", ".mol", ".smi", ".smiles", ".txt", ".csv"})
-DEFAULT_LIGAND_FILENAME = "ligands.smi"
-SDF_RECORD_SEPARATOR = "$$$$"
-BRACKET_ATOM_PATTERN = re.compile(r"\[[^\]]*\]")
-SMILES_BODY_PATTERN = re.compile(r"^[BCNOPSFIHlrbcnops0-9()=#@+\-/\\%.*]{2,}$")
-ELEMENT_CHARACTERS = frozenset("BCNOPSFIHbcnops")
-ALLOWED_JOB_PARAMS = frozenset(
-    {"exhaustiveness", "num_modes", "seed", "cpu", "receptor_ph", "binding_site_padding"}
-)
-GPU_WORKLOADS = frozenset({"md_stability", "fold_affinity"})
-IMPLEMENTED_WORKLOADS = frozenset({"dock"})
-
-
-SIGNING_FAILURES = (AttributeError, GoogleAuthError, google_api_exceptions.GoogleAPICallError)
-
-
 async def downloadable_results_link(results_archive_uri: str | None) -> str:
     if not results_archive_uri:
         return "no results archive was produced"
@@ -121,105 +158,6 @@ async def downloadable_results_link(results_archive_uri: str | None) -> str:
         )
     except SIGNING_FAILURES:
         return authenticated_browser_url(results_archive_uri)
-
-
-def unusable_library_questions(intent: CampaignIntent, library: LigandLibrary) -> list[str]:
-    questions = []
-    named_control = (intent.control_compound or "").strip().lower()
-    known_names = {name.lower() for name in library.compound_names}
-    if named_control and known_names and named_control not in known_names:
-        questions.append(
-            f"The control compound {intent.control_compound!r} is not among the "
-            f"{library.compound_count} compounds CASCADE could read "
-            f"({', '.join(library.compound_names)}). Without it the run cannot be validated. "
-            f"Trello rewrites SMILES containing bracketed stereocentres because [X](Y) is "
-            f"Markdown link syntax — attach a .smi file or wrap each SMILES in backticks."
-        )
-    if (
-        intent.expected_compound_count is not None
-        and intent.expected_compound_count != library.compound_count
-    ):
-        questions.append(
-            f"The card lists {intent.expected_compound_count} compounds but CASCADE could only "
-            f"read {library.compound_count}. Check the SMILES that did not survive: Trello "
-            f"rewrites [X](Y) sequences as Markdown links."
-        )
-    return questions
-
-
-def skipped_lines_note(skipped_lines: int) -> str:
-    if skipped_lines == 0:
-        return ""
-    return f", {skipped_lines} unreadable line(s) skipped"
-
-
-def executor_for_workload(workload: str, compound_count: int) -> str:
-    if workload in GPU_WORKLOADS or compound_count > settings.max_ligands_per_cloud_run_job:
-        return "cloud_batch"
-    return "cloud_run_job"
-
-
-def unsupported_stage_rationale(workload: str, compound_count: int) -> str | None:
-    if workload not in IMPLEMENTED_WORKLOADS:
-        return (
-            f"{workload} has no workload container yet, so CASCADE cannot run this stage. "
-            f"Only {', '.join(sorted(IMPLEMENTED_WORKLOADS))} is implemented."
-        )
-    if executor_for_workload(workload, compound_count) != "cloud_run_job":
-        return (
-            f"{compound_count} compounds exceeds the "
-            f"{settings.max_ligands_per_cloud_run_job}-ligand Cloud Run Job ceiling, and "
-            f"Cloud Batch submission is not implemented yet."
-        )
-    return None
-
-
-def deterministic_run_id(card_id: str, stage: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cascade:run:{card_id}:{stage}"))
-
-
-def looks_like_smiles(token: str) -> bool:
-    outside_brackets = BRACKET_ATOM_PATTERN.sub("", token)
-    if not SMILES_BODY_PATTERN.match(outside_brackets):
-        return False
-    return bool(set(outside_brackets) & ELEMENT_CHARACTERS)
-
-
-def smiles_library_lines_from_text(text: str) -> tuple[list[str], int]:
-    kept: list[str] = []
-    skipped = 0
-    for line in text.splitlines():
-        stripped = line.replace("`", "").strip().lstrip("-*•").strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        token, *name_fields = stripped.split()
-        if not looks_like_smiles(token):
-            skipped += 1
-            continue
-        name = "_".join(name_fields) if name_fields else f"compound_{len(kept) + 1}"
-        kept.append(f"{token}\t{name}")
-    return kept, skipped
-
-
-def compound_names_from_library_lines(lines: list[str]) -> list[str]:
-    return [line.split("\t")[1] for line in lines if "\t" in line]
-
-
-def ligand_filename_for_reference(reference: str) -> str:
-    suffix = PurePosixPath(reference).suffix.lower()
-    if suffix in LIGAND_SUFFIXES:
-        return f"ligands{suffix}"
-    return DEFAULT_LIGAND_FILENAME
-
-
-def compound_count_in_library(filename: str, text: str) -> int:
-    if filename.endswith((".sdf", ".sd", ".mol")):
-        return len([block for block in text.split(SDF_RECORD_SEPARATOR) if block.strip()])
-    if filename.endswith(".csv"):
-        return max(len([line for line in text.splitlines() if line.strip()]) - 1, 0)
-    return len(
-        [line.strip() for line in text.splitlines() if line.strip() and line.strip()[0] != "#"]
-    )
 
 
 @node(timeout=30.0)
@@ -281,7 +219,9 @@ async def submit_workload_job(ctx: Context, node_input: JobLaunch) -> JobSubmiss
         ligands_uri=node_input.library.ligands_uri,
         binding_site=node_input.plan.binding_site,
         params={
-            key: value for key, value in node_input.plan.params.items() if key in ALLOWED_JOB_PARAMS
+            key: value
+            for key, value in node_input.plan.params.model_dump(exclude_none=True).items()
+            if key in allowed_job_params_for_workload(node_input.workload)
         },
         output_uri=output_uri,
         control_compound=node_input.plan.control_compound,
@@ -293,6 +233,15 @@ async def submit_workload_job(ctx: Context, node_input: JobLaunch) -> JobSubmiss
         spec,
         node_input.executor,
         node_input.attempt,
+        node_input.parent_run_id,
+    )
+    await record_decision(
+        node_input.run_id,
+        "planner",
+        f"{node_input.workload}_plan",
+        node_input.plan.rationale,
+        {"attempt": node_input.attempt, "compound_count": node_input.library.compound_count},
+        node_input.plan.model_dump(exclude_none=True),
     )
     if execution_name is None:
         execution_name = await cloud_run_jobs.submit_workload_execution(
@@ -310,17 +259,20 @@ async def submit_workload_job(ctx: Context, node_input: JobLaunch) -> JobSubmiss
         spec_uri=gcs.uri_for_path(run_spec_path(node_input.run_id, node_input.attempt)),
         output_uri=output_uri,
         library=node_input.library,
+        plan=node_input.plan,
     )
 
 
 @node(retry_config=FETCH_RETRY, timeout=30.0)
 async def announce_job_submitted_on_card(ctx: Context, node_input: JobSubmission) -> JobSubmission:
+    decisions = "\n".join(planner_decision_lines(node_input.plan, node_input.workload))
     await trello.add_comment(
         node_input.card_id,
         f"**{node_input.workload} job submitted.**\n\n"
         f"Run: `{node_input.run_id}` (attempt {node_input.attempt})\n"
         f"{node_input.library.compound_count} compounds queued"
-        f"{skipped_lines_note(node_input.library.skipped_lines)}.\n"
+        f"{skipped_lines_note(node_input.library.skipped_lines)}.\n\n"
+        f"{decisions}\n\n"
         f"[Results folder]({storage_console_url(node_input.output_uri)})",
     )
     return node_input
@@ -355,45 +307,202 @@ async def record_job_outcome(ctx: Context, node_input: JobResult) -> StageOutcom
     return StageOutcome(run_id=outcome.run_id, status=outcome.status, artifacts_recorded=recorded)
 
 
-def job_outcome_headline(outcome: JobOutcome) -> str:
-    if outcome.status != "succeeded":
-        return f"{outcome.workload} failed with exit code {outcome.exit_code}: {outcome.error}"
-    summary = outcome.summary
-    docked = summary.get("ligands_docked", "unknown")
-    failed = summary.get("ligands_failed", 0)
-    best = summary.get("best_compound_id", "unknown")
-    affinity = summary.get("best_affinity_kcal_per_mol", "unknown")
-    return (
-        f"{docked} compounds docked ({failed} failed to load); best was {best} "
-        f"at {affinity} kcal/mol"
+@node(retry_config=FETCH_RETRY, timeout=60.0)
+async def build_triage_request(ctx: Context, node_input: JobResult) -> TriageRequest:
+    outcome = node_input.outcome
+    manifest: dict = {}
+    if outcome.results_manifest_uri:
+        try:
+            manifest = await gcs.download_json_from_uri(outcome.results_manifest_uri)
+        except MANIFEST_READ_FAILURES:
+            manifest = {}
+    control_summary = (
+        manifest.get("control_compound") or outcome.summary.get("control_compound") or {}
+    )
+    attempt = node_input.submission.attempt
+    return TriageRequest(
+        run_id=outcome.run_id,
+        workload=outcome.workload,
+        attempt=attempt,
+        attempts_remaining=attempts_remaining_after(attempt),
+        control=control_check_for_job(outcome.workload, control_summary),
+        score_analysis=manifest.get("score_analysis") or {},
+        scores=compound_records_from_manifest(outcome.workload, manifest),
+        job_summary=outcome.summary,
+    )
+
+
+@node(timeout=60.0)
+async def apply_triage_verdict(ctx: Context, node_input: TriageDecision) -> TriagedJobResult:
+    request = node_input.request
+    verdict = enforce_control_gate(node_input.verdict, request.control, request.attempts_remaining)
+    verdict = hold_every_scored_compound_when_triage_judged_none(verdict, request.scores)
+    verdict = verdict.model_copy(
+        update={
+            "rationale": agent_prose_without_runaway_text(verdict.rationale, verdict.headline),
+        }
+    )
+    await record_decision(
+        request.run_id,
+        "triage",
+        f"{request.workload}_triage",
+        verdict.rationale,
+        request.model_dump(exclude_none=True),
+        verdict.model_dump(),
+    )
+    return TriagedJobResult(result=node_input.result, verdict=verdict, control=request.control)
+
+
+@node(timeout=30.0)
+async def build_proposal_request(ctx: Context, node_input: CompletedStage) -> ProposalRequest:
+    verdict = node_input.triaged.verdict
+    completed_stage = node_input.triaged.result.outcome.workload
+    carried, disposition = compounds_carried_to_next_stage(verdict)
+    if not verdict.run_is_trustworthy:
+        runnable: list[str] = []
+        blocked: list[BlockedStage] = []
+    else:
+        already_run = await workloads_already_run_in_lineage(
+            node_input.triaged.result.outcome.run_id
+        )
+        runnable, blocked = next_stage_options(completed_stage, len(carried), already_run)
+    return ProposalRequest(
+        completed_stage=completed_stage,
+        target_name=node_input.target_name,
+        run_is_trustworthy=verdict.run_is_trustworthy,
+        results_discriminate=verdict.results_discriminate,
+        triage_headline=verdict.headline,
+        carried_compounds=carried,
+        carried_disposition=disposition,
+        runnable_next_stages=runnable,
+        blocked_next_stages=blocked,
+    )
+
+
+@node(timeout=60.0)
+async def create_recommended_card(ctx: Context, node_input: ProposalDecision) -> ProposedFollowup:
+    request = node_input.request
+    proposal = node_input.proposal.model_copy(
+        update={
+            "reason": agent_prose_without_runaway_text(
+                node_input.proposal.reason, request.triage_headline
+            ),
+            "rationale": agent_prose_without_runaway_text(
+                node_input.proposal.rationale, request.triage_headline
+            ),
+        }
+    )
+    submission = node_input.completed.triaged.result.submission
+    blocked_note = blocked_stages_note(request.blocked_next_stages)
+    if proposal.next_stage is None or proposal.next_stage not in request.runnable_next_stages:
+        return ProposedFollowup(
+            note=f"CASCADE is not proposing a follow-up stage. {' '.join(proposal.reason.split())}",
+            blocked_note=blocked_note,
+        )
+
+    carried_names = [judgement.compound_id for judgement in request.carried_compounds]
+    try:
+        library_text = await gcs.download_text_from_uri(submission.library.ligands_uri)
+    except MANIFEST_READ_FAILURES:
+        library_text = ""
+    library_lines = library_lines_for_compounds(library_text, carried_names)
+    if not library_lines:
+        return ProposedFollowup(
+            note=(
+                f"A {proposal.next_stage} stage is the right next step, but CASCADE could not "
+                f"recover the structures of the carried compounds from "
+                f"`{submission.library.ligands_uri}`, so it did not create a card that the next "
+                f"campaign would be unable to read. Attach the library to a new card instead."
+            ),
+            blocked_note=blocked_note,
+        )
+
+    description = proposed_card_description(
+        node_input.model_copy(update={"proposal": proposal}), library_lines, submission.run_id
+    )
+    card = await trello.create_card(
+        settings.trello_list_recommended, proposal.card_title, description
+    )
+    followup = ProposedFollowup(
+        next_stage=proposal.next_stage,
+        created_card_id=card["id"],
+        created_card_url=card.get("url"),
+        carried_compounds=carried_names,
+        note=" ".join(proposal.reason.split()),
+        blocked_note=blocked_note,
+    )
+    await record_decision(
+        submission.run_id,
+        "proposer",
+        f"{request.completed_stage}_followup",
+        proposal.rationale,
+        request.model_dump(exclude_none=True),
+        followup.model_dump(),
+    )
+    return followup
+
+
+@node(retry_config=FETCH_RETRY, timeout=30.0)
+async def announce_control_failure_rerun_on_card(
+    ctx: Context, node_input: TriagedJobResult
+) -> TriagedJobResult:
+    await trello.add_comment(
+        node_input.result.submission.card_id,
+        f"**Control compound check failed.** {node_input.control.detail}\n\n"
+        "The pipeline could not reproduce a pose it is known to get right, so nothing in this run "
+        "can be read as a result yet. Ring conformations are fixed before docking starts, so the "
+        "re-run generates more starting conformers per compound "
+        f"({settings.control_rerun_conformers_per_ligand} instead of the default) rather than "
+        "searching harder from the same geometry.",
+    )
+    return node_input
+
+
+@node(retry_config=FETCH_RETRY, timeout=30.0)
+async def escalate_untrustworthy_run_on_card(
+    ctx: Context, node_input: TriagedJobResult
+) -> CampaignOutcome:
+    submission = node_input.result.submission
+    await trello.add_comment(
+        submission.card_id,
+        f"{triage_card_comment(node_input)}\n\n"
+        f"Run `{submission.run_id}`, attempt {submission.attempt}. This needs a scientist.",
+    )
+    await trello.move_card(submission.card_id, settings.trello_list_needs_attention)
+    return CampaignOutcome(
+        status="needs_attention",
+        campaign_id=submission.campaign_id,
+        card_id=submission.card_id,
+        rationale=node_input.verdict.rationale,
     )
 
 
 @node(retry_config=FETCH_RETRY, timeout=30.0)
-async def complete_campaign_on_card(ctx: Context, node_input: JobResult) -> CampaignOutcome:
-    outcome = node_input.outcome
-    control = outcome.summary.get("control_compound") or {}
-    control_line = ""
-    if control:
-        control_line = (
-            f"\nControl `{control.get('requested_name')}`: {control.get('status')}"
-            f" (best-mode RMSD {control.get('lowest_mode_rmsd_angstrom')} A"
-            f" at rank {control.get('lowest_mode_rank')})"
-        )
+async def complete_campaign_on_card(
+    ctx: Context, node_input: CampaignCompletion
+) -> CampaignOutcome:
+    triaged = node_input.triaged
+    submission = triaged.result.submission
+    outcome = triaged.result.outcome
+    control_line = control_compound_line(
+        outcome.workload, outcome.summary.get("control_compound") or {}
+    )
     results_link = await downloadable_results_link(outcome.results_archive_uri)
     headline = job_outcome_headline(outcome)
     await trello.add_comment(
-        node_input.submission.card_id,
+        submission.card_id,
         f"**{outcome.workload} finished.**\n\n{headline}{control_line}\n\n"
         f"[Download results]({results_link})\n\n"
-        f"Archived at `{outcome.results_uri}`",
+        f"Archived at `{outcome.results_uri}`\n\n---\n\n"
+        f"{triage_card_comment(triaged)}\n\n---\n\n"
+        f"{followup_card_comment(node_input.followup)}",
     )
-    await trello.move_card(node_input.submission.card_id, settings.trello_list_done)
+    await trello.move_card(submission.card_id, settings.trello_list_done)
     return CampaignOutcome(
         status="completed",
-        campaign_id=node_input.submission.campaign_id,
-        card_id=node_input.submission.card_id,
-        rationale=headline,
+        campaign_id=submission.campaign_id,
+        card_id=submission.card_id,
+        rationale=triaged.verdict.rationale,
     )
 
 

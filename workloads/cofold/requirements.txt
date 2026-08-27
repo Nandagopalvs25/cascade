@@ -1,0 +1,5 @@
+google-cloud-pubsub==2.39.1
+google-cloud-storage==3.13.1
+protenix==2.0.0
+pydantic==2.13.4
+rdkit==2026.3.5

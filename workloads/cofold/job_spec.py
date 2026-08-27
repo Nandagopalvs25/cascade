@@ -5,6 +5,8 @@ from pydantic import BaseModel, ConfigDict, Field
 Workload = Literal["dock", "admet", "md_stability", "cofold"]
 TargetSource = Literal["rcsb", "card_attachment", "url"]
 
+DEFAULT_PROTENIX_MODEL = "protenix_base_default_v1.0.0"
+
 
 class BindingSite(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -15,14 +17,6 @@ class BindingSite(BaseModel):
     size_x: float = 20.0
     size_y: float = 20.0
     size_z: float = 20.0
-
-    @property
-    def center(self) -> list[float]:
-        return [self.center_x, self.center_y, self.center_z]
-
-    @property
-    def box_size(self) -> list[float]:
-        return [self.size_x, self.size_y, self.size_z]
 
 
 class TargetStructure(BaseModel):
@@ -48,20 +42,24 @@ class JobSpec(BaseModel):
     control_compound: str | None = None
 
 
-class DockingParams(BaseModel):
+class FoldParams(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    exhaustiveness: int = Field(default=8, ge=1, le=512)
-    num_modes: int = Field(default=9, ge=1, le=50)
-    seed: int = 42
-    cpu: int = Field(default=0, ge=0)
-    receptor_ph: float = Field(default=7.4, ge=0.0, le=14.0)
-    ligand_ph: float | None = Field(default=7.4, ge=0.0, le=14.0)
-    conformers_per_ligand: int = Field(default=4, ge=1, le=32)
-    binding_site_padding: float = Field(default=5.0, ge=0.0, le=20.0)
-    max_ligands: int = Field(default=500, ge=1)
-    scoring_function_error_kcal_per_mol: float = Field(default=2.0, gt=0.0, le=10.0)
+    model_name: str = DEFAULT_PROTENIX_MODEL
+    seeds: list[int] = Field(default_factory=lambda: [101])
+    cycles: int = Field(default=10, ge=1, le=20)
+    diffusion_steps: int = Field(default=200, ge=1, le=1000)
+    samples_per_seed: int = Field(default=5, ge=1, le=25)
+    dtype: Literal["bf16", "fp32"] = "bf16"
+    use_msa: bool = False
+    max_complexes: int = Field(default=8, ge=1, le=64)
+    prediction_timeout_seconds: int = Field(default=3000, ge=60)
+    protein_sequence: str | None = None
 
     @classmethod
-    def from_job_spec(cls, spec: JobSpec) -> "DockingParams":
+    def from_job_spec(cls, spec: JobSpec) -> "FoldParams":
         return cls.model_validate(spec.params)
+
+    @property
+    def seeds_argument(self) -> str:
+        return ",".join(str(seed) for seed in self.seeds)

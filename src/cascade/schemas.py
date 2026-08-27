@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-Workload = Literal["dock", "admet", "md_stability", "fold_affinity"]
+Workload = Literal["dock", "admet", "md_stability", "cofold"]
 TargetSource = Literal["rcsb", "card_attachment", "url"]
 
 RCSB_ID_PATTERN = re.compile(r"^[0-9][A-Za-z0-9]{3}$")

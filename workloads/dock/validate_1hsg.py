@@ -207,7 +207,7 @@ def run_validation(arguments: argparse.Namespace) -> dict:
     decisive_trial = next(
         trial
         for trial in trials
-        if trial.variant == CRYSTAL_CONFORMER_VARIANT
+        if trial.variant == GENERATED_CONFORMER_VARIANT
         and trial.exhaustiveness == highest_exhaustiveness
     )
     passed = decisive_trial.best_pose_rmsd_angstrom < arguments.rmsd_threshold
@@ -262,10 +262,11 @@ def print_report(report: dict) -> None:
     print()
     verdict = "PASS" if report["passed"] else "FAIL"
     print(
-        f"{verdict}: crystal conformer at exhaustiveness "
-        f"{report['decisive_trial']['exhaustiveness']} reproduced the crystal pose to "
+        f"{verdict}: {report['decisive_trial']['variant']} at exhaustiveness "
+        f"{report['decisive_trial']['exhaustiveness']} put the crystal pose at rank 1 within "
         f"{report['decisive_trial']['best_pose_rmsd_angstrom']:.2f} A "
-        f"(threshold {report['rmsd_threshold_angstrom']} A)"
+        f"(threshold {report['rmsd_threshold_angstrom']} A). This is the variant production docks; "
+        f"the crystal-conformer row only shows the receptor and box are sound."
     )
 
 

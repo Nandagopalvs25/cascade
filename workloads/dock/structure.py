@@ -50,6 +50,24 @@ NON_LIGAND_HETERO_RESIDUE_NAMES = frozenset(
     }
 )
 
+STRUCTURAL_METAL_RESIDUE_NAMES = frozenset(
+    {
+        "CA",
+        "CD",
+        "CO",
+        "CU",
+        "CU1",
+        "FE",
+        "FE2",
+        "K",
+        "MG",
+        "MN",
+        "NA",
+        "NI",
+        "ZN",
+    }
+)
+
 MINIMUM_LIGAND_HEAVY_ATOMS = 6
 MINIMUM_BOX_EDGE = 16.0
 MAXIMUM_BOX_EDGE = 30.0
@@ -117,21 +135,29 @@ def _first_model_lines(pdb_text: str) -> list[str]:
 
 def extract_protein_receptor_pdb(pdb_text: str, chain: str | None = None) -> str:
     kept: list[str] = []
+    protein_atoms = 0
     for line in _first_model_lines(pdb_text):
         if line.startswith("TER"):
             if chain is None or (len(line) > 21 and line[21] == chain):
                 kept.append(line)
             continue
-        if not line.startswith("ATOM"):
+        if not line.startswith(("ATOM", "HETATM")):
             continue
         if chain is not None and line[21] != chain:
             continue
         if line[16] not in (" ", "A"):
             continue
-        if line[17:20].strip() in WATER_RESIDUE_NAMES:
+        residue_name = line[17:20].strip()
+        if residue_name in WATER_RESIDUE_NAMES:
+            continue
+        if line.startswith("HETATM"):
+            if residue_name not in STRUCTURAL_METAL_RESIDUE_NAMES:
+                continue
+            kept.append(line)
             continue
         kept.append(line)
-    if not kept:
+        protein_atoms += 1
+    if not protein_atoms:
         raise ValueError(
             f"no protein ATOM records found in structure for chain {chain!r}"
             if chain
@@ -143,7 +169,7 @@ def extract_protein_receptor_pdb(pdb_text: str, chain: str | None = None) -> str
 def receptor_chain_ids(receptor_pdb: str) -> list[str]:
     seen: list[str] = []
     for line in receptor_pdb.splitlines():
-        if line.startswith("ATOM"):
+        if line.startswith(("ATOM", "HETATM")):
             chain_id = line[21]
             if chain_id not in seen:
                 seen.append(chain_id)
@@ -151,7 +177,18 @@ def receptor_chain_ids(receptor_pdb: str) -> list[str]:
 
 
 def receptor_atom_count(receptor_pdb: str) -> int:
-    return sum(1 for line in receptor_pdb.splitlines() if line.startswith("ATOM"))
+    return sum(1 for line in receptor_pdb.splitlines() if line.startswith(("ATOM", "HETATM")))
+
+
+def receptor_metal_labels(receptor_pdb: str) -> list[str]:
+    labels: list[str] = []
+    for line in receptor_pdb.splitlines():
+        if not line.startswith("HETATM"):
+            continue
+        label = f"{line[17:20].strip()}:{line[21] or '_'}:{line[22:27].strip()}"
+        if label not in labels:
+            labels.append(label)
+    return labels
 
 
 def find_cocrystal_ligands(pdb_text: str, chain: str | None = None) -> list[HeteroResidue]:
