@@ -29,3 +29,15 @@ output "dock_job_name" {
 output "cascade_dock_service_account" {
   value = google_service_account.cascade_dock.email
 }
+
+output "gpu_artifact_registry_repo" {
+  value = "${var.gpu_region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.cascade_gpu.repository_id}"
+}
+
+output "md_stability_job_name" {
+  value = google_cloud_run_v2_job.md_stability.name
+}
+
+output "md_stability_job_region" {
+  value = google_cloud_run_v2_job.md_stability.location
+}

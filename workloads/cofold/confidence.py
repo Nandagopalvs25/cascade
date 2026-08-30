@@ -32,10 +32,6 @@ class ComplexPrediction:
     metrics: dict = field(default_factory=dict)
     structure_path: Path | None = None
 
-    @property
-    def structure_file_name(self) -> str:
-        return self.structure_path.name if self.structure_path is not None else ""
-
 
 def _seed_from_path(path: Path) -> int | None:
     for part in path.parts:

@@ -34,7 +34,7 @@ class JobSpec(BaseModel):
 
     run_id: str
     workload: Workload
-    target: TargetStructure
+    target: TargetStructure | None = None
     ligands_uri: str
     binding_site: BindingSite | None = None
     params: dict = Field(default_factory=dict)
@@ -63,3 +63,12 @@ class FoldParams(BaseModel):
     @property
     def seeds_argument(self) -> str:
         return ",".join(str(seed) for seed in self.seeds)
+
+
+def require_target_structure(spec: JobSpec) -> TargetStructure:
+    if spec.target is None:
+        raise ValueError(
+            f"the {spec.workload} container needs a protein structure, but the job spec carries "
+            "none"
+        )
+    return spec.target

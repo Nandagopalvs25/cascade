@@ -1,0 +1,17 @@
+name: base
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - cuda-version=12.6
+  - openmm=8.3
+  - openmmforcefields=0.15
+  - ambertools=24
+  - openff-toolkit
+  - pdbfixer
+  - rdkit
+  - pip
+  - pip:
+      - google-cloud-pubsub==2.39.1
+      - google-cloud-storage==3.13.1
+      - pydantic==2.13.4

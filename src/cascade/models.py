@@ -4,7 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
 from cascade.db import Base
 
@@ -37,11 +37,6 @@ class Run(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    card_events: Mapped[list["CardEvent"]] = relationship(back_populates="run")
-    jobs: Mapped[list["Job"]] = relationship(back_populates="run")
-    decisions: Mapped[list["Decision"]] = relationship(back_populates="run")
-    artifacts: Mapped[list["Artifact"]] = relationship(back_populates="run")
-
 
 class CardEvent(Base):
     __tablename__ = "card_events"
@@ -57,8 +52,6 @@ class CardEvent(Base):
         DateTime(timezone=True), server_default=text("now()")
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-    run: Mapped[Run | None] = relationship(back_populates="card_events")
 
 
 class Decision(Base):
@@ -76,8 +69,6 @@ class Decision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )
-
-    run: Mapped[Run] = relationship(back_populates="decisions")
 
 
 class JobState(enum.StrEnum):
@@ -107,8 +98,6 @@ class Job(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    run: Mapped[Run] = relationship(back_populates="jobs")
-
 
 class Artifact(Base):
     __tablename__ = "artifacts"
@@ -122,5 +111,3 @@ class Artifact(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()")
     )
-
-    run: Mapped[Run] = relationship(back_populates="artifacts")

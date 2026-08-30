@@ -10,7 +10,7 @@ from cascade.agents.compound_library import unusable_library_questions
 from cascade.agents.definitions import (
     intake_agent,
     planner_agent,
-    proposer_agent,
+    stage_decision_agent,
     triage_agent,
 )
 from cascade.agents.nodes import (
@@ -18,10 +18,9 @@ from cascade.agents.nodes import (
     announce_intake_on_card,
     announce_job_submitted_on_card,
     apply_triage_verdict,
-    archive_target_structure,
     ask_scientist_for_clarification,
     await_job_completion,
-    build_proposal_request,
+    build_stage_decision_request,
     build_triage_request,
     complete_campaign_on_card,
     create_recommended_card,
@@ -29,15 +28,20 @@ from cascade.agents.nodes import (
     escalate_untrustworthy_run_on_card,
     fetch_card_and_attachments,
     load_campaign_state,
-    prepare_ligand_library,
     record_job_outcome,
+    record_stage_choice_in_decision_log,
+    report_no_stage_chosen_on_card,
     report_unsupported_executor_on_card,
+    resolve_inputs_for_stage,
     submit_workload_job,
 )
 from cascade.agents.policy import (
     deterministic_run_id,
     executor_for_workload,
     plan_escalated_after_control_failure,
+    proposal_decision_from_stage_decision,
+    stage_blocking_reasons_for_requested_stages,
+    stage_choice_rejection_reason,
     unsupported_stage_rationale,
 )
 from cascade.agents.schemas import (
@@ -53,13 +57,16 @@ from cascade.agents.schemas import (
     JobOutcome,
     JobResult,
     JobSubmission,
-    LigandLibrary,
-    LigandRequest,
+    NoStageChosen,
     PlanRequest,
-    ProposalDecision,
-    ProposalRequest,
     ProposedFollowup,
-    StageProposal,
+    RejectedStageChoice,
+    ResolvedStageInputs,
+    StageDecision,
+    StageDecisionInputs,
+    StageDecisionRecord,
+    StageDecisionRequest,
+    StageInputRequest,
     TriageDecision,
     TriagedJobResult,
     TriageRequest,
@@ -67,19 +74,127 @@ from cascade.agents.schemas import (
     UnsupportedExecutor,
     WorkloadPlan,
 )
-from cascade.schemas import TargetRequest
+from cascade.config import get_settings
+from cascade.schemas import Workload
 
-DEFAULT_STAGE = "dock"
+settings = get_settings()
+
 FIRST_ATTEMPT = 1
 
 
-def missing_campaign_inputs(intent: CampaignIntent) -> list[str]:
-    missing = []
-    if not intent.target_source or not intent.target_reference:
-        missing.append("Which protein structure should CASCADE screen against?")
-    if not intent.ligand_source or not intent.ligand_reference:
-        missing.append("Which compounds should CASCADE screen?")
-    return missing
+async def validated_stage_decision(
+    ctx: Context, request: StageDecisionRequest, run_id_prefix: str
+) -> tuple[StageDecision, StageDecisionRequest]:
+    decision = StageDecision(
+        chosen_stage=None,
+        question_it_answers="",
+        card_title="",
+        reason="",
+        rationale="",
+    )
+    for choice in range(1, settings.max_stage_decision_attempts + 1):
+        request = request.model_copy(
+            update={"choices_remaining": settings.max_stage_decision_attempts - choice}
+        )
+        decision = StageDecision.model_validate(
+            await ctx.run_node(
+                stage_decision_agent, request, run_id=f"{run_id_prefix}-choice{choice}"
+            )
+        )
+        rejection = stage_choice_rejection_reason(decision, request)
+        if rejection is None:
+            return decision, request
+        request = request.model_copy(
+            update={
+                "rejected_choices": [
+                    *request.rejected_choices,
+                    RejectedStageChoice(stage=decision.chosen_stage, reason=rejection),
+                ]
+            }
+        )
+    return decision.model_copy(update={"chosen_stage": None}), request
+
+
+async def propose_follow_up_and_finish(
+    ctx: Context,
+    card: CardInputs,
+    intent: CampaignIntent,
+    triaged: TriagedJobResult,
+    stage: Workload,
+    attempt: int,
+) -> CampaignOutcome:
+    completed = CompletedStage(
+        triaged=triaged,
+        target_name=intent.target_name,
+        target_source=intent.target_source,
+        target_reference=intent.target_reference,
+    )
+    next_request = StageDecisionRequest.model_validate(
+        await ctx.run_node(
+            build_stage_decision_request,
+            StageDecisionInputs(
+                decision_point="next_stage",
+                card=card,
+                intent=intent,
+                completed=completed,
+                attachment_names=card.attachment_names,
+            ),
+            run_id=f"next-stage-inputs-{stage}-{attempt}",
+        )
+    )
+    next_decision, next_request = await validated_stage_decision(
+        ctx, next_request, run_id_prefix=f"next-stage-{stage}-{attempt}"
+    )
+    await ctx.run_node(
+        record_stage_choice_in_decision_log,
+        StageDecisionRecord(
+            run_id=triaged.result.outcome.run_id,
+            request=next_request,
+            decision=next_decision,
+        ),
+        run_id=f"record-next-stage-{stage}-{attempt}",
+    )
+    proposal = proposal_decision_from_stage_decision(completed, next_request, next_decision)
+    followup = ProposedFollowup(
+        note=unproposed_stage_note(proposal.request),
+        blocked_note=blocked_stages_note(proposal.request.blocked_next_stages),
+    )
+    if next_decision.chosen_stage is not None:
+        followup = ProposedFollowup.model_validate(
+            await ctx.run_node(
+                create_recommended_card, proposal, run_id=f"propose-card-{stage}-{attempt}"
+            )
+        )
+    return CampaignOutcome.model_validate(
+        await ctx.run_node(
+            complete_campaign_on_card,
+            CampaignCompletion(triaged=triaged, followup=followup),
+            run_id=f"complete-{stage}-{attempt}",
+        )
+    )
+
+
+async def ask_for_clarification_and_stop(
+    ctx: Context,
+    node_input: CardTrigger,
+    intent: CampaignIntent,
+    questions: list[str],
+    run_id: str,
+) -> CampaignOutcome:
+    await ctx.run_node(
+        ask_scientist_for_clarification,
+        IntakeAnnouncement(
+            card_id=node_input.card_id,
+            intent=intent.model_copy(update={"ambiguities": questions}),
+        ),
+        run_id=run_id,
+    )
+    return CampaignOutcome(
+        status="needs_clarification",
+        campaign_id=node_input.campaign_id,
+        card_id=node_input.card_id,
+        rationale=questions[0],
+    )
 
 
 @node(rerun_on_resume=True)
@@ -107,20 +222,74 @@ async def run_campaign(ctx: Context, node_input: CardTrigger) -> CampaignOutcome
         await ctx.run_node(intake_agent, card, run_id=f"intake-{action_id}")
     )
 
-    blocking = intent.ambiguities + missing_campaign_inputs(intent)
-    if blocking:
-        intent = intent.model_copy(update={"ambiguities": blocking})
-        await ctx.run_node(
-            ask_scientist_for_clarification,
-            IntakeAnnouncement(card_id=node_input.card_id, intent=intent),
-            run_id=f"clarify-{action_id}",
+    if intent.ambiguities:
+        return await ask_for_clarification_and_stop(
+            ctx, node_input, intent, intent.ambiguities, f"clarify-intake-{action_id}"
         )
-        return CampaignOutcome(
-            status="needs_clarification",
-            campaign_id=node_input.campaign_id,
-            card_id=node_input.card_id,
-            target_name=intent.target_name,
-            rationale=intent.rationale,
+
+    parent_run_id = parent_run_id_in_card_description(card.description)
+
+    first_stage_request = StageDecisionRequest.model_validate(
+        await ctx.run_node(
+            build_stage_decision_request,
+            StageDecisionInputs(
+                decision_point="first_stage",
+                card=card,
+                intent=intent,
+                parent_run_id=parent_run_id,
+                attachment_names=card.attachment_names,
+            ),
+            run_id=f"stage-decision-inputs-{action_id}",
+        )
+    )
+    first_decision, first_stage_request = await validated_stage_decision(
+        ctx, first_stage_request, run_id_prefix=f"first-stage-{action_id}"
+    )
+    if first_decision.chosen_stage is None:
+        unrunnable = stage_blocking_reasons_for_requested_stages(intent, first_stage_request)
+        if unrunnable:
+            return await ask_for_clarification_and_stop(
+                ctx, node_input, intent, unrunnable, f"clarify-no-stage-{action_id}"
+            )
+        return CampaignOutcome.model_validate(
+            await ctx.run_node(
+                report_no_stage_chosen_on_card,
+                NoStageChosen(
+                    campaign_id=node_input.campaign_id,
+                    card_id=node_input.card_id,
+                    decision=first_decision,
+                ),
+                run_id=f"no-stage-{action_id}",
+            )
+        )
+
+    stage = first_decision.chosen_stage
+    run_id = deterministic_run_id(node_input.card_id, stage)
+
+    resolved = ResolvedStageInputs.model_validate(
+        await ctx.run_node(
+            resolve_inputs_for_stage,
+            StageInputRequest(
+                run_id=run_id,
+                card_id=node_input.card_id,
+                stage=stage,
+                intent=intent,
+                card_description=card.description,
+                attachment_names=card.attachment_names,
+                parent_run_id=parent_run_id,
+            ),
+            run_id=f"inputs-{stage}-{action_id}",
+        )
+    )
+
+    blocking = [
+        *intent.ambiguities,
+        *[requirement.question for requirement in resolved.unmet],
+        *unusable_library_questions(intent, resolved.library),
+    ]
+    if blocking:
+        return await ask_for_clarification_and_stop(
+            ctx, node_input, intent, blocking, f"clarify-{stage}-{action_id}"
         )
 
     await ctx.run_node(
@@ -129,51 +298,8 @@ async def run_campaign(ctx: Context, node_input: CardTrigger) -> CampaignOutcome
         run_id=f"announce-intake-{action_id}",
     )
 
-    stage = intent.requested_stages[0] if intent.requested_stages else DEFAULT_STAGE
-    run_id = deterministic_run_id(node_input.card_id, stage)
-    parent_run_id = parent_run_id_in_card_description(card.description)
-
-    library = LigandLibrary.model_validate(
-        await ctx.run_node(
-            prepare_ligand_library,
-            LigandRequest(
-                run_id=run_id,
-                card_id=node_input.card_id,
-                source=intent.ligand_source,
-                reference=intent.ligand_reference,
-                card_description=card.description,
-            ),
-            run_id=f"ligands-{stage}-{action_id}",
-        )
-    )
-    library_problems = unusable_library_questions(intent, library)
-    if library_problems:
-        await ctx.run_node(
-            ask_scientist_for_clarification,
-            IntakeAnnouncement(
-                card_id=node_input.card_id,
-                intent=intent.model_copy(update={"ambiguities": library_problems}),
-            ),
-            run_id=f"clarify-library-{stage}-{action_id}",
-        )
-        return CampaignOutcome(
-            status="needs_clarification",
-            campaign_id=node_input.campaign_id,
-            card_id=node_input.card_id,
-            target_name=intent.target_name,
-            rationale=library_problems[0],
-        )
-
-    target = await ctx.run_node(
-        archive_target_structure,
-        TargetRequest(
-            run_id=run_id,
-            card_id=node_input.card_id,
-            source=intent.target_source,
-            reference=intent.target_reference,
-        ),
-        run_id=f"target-{stage}",
-    )
+    library = resolved.library
+    target = resolved.target
 
     plan = WorkloadPlan.model_validate(
         await ctx.run_node(
@@ -182,7 +308,7 @@ async def run_campaign(ctx: Context, node_input: CardTrigger) -> CampaignOutcome
                 intent=intent,
                 stage=stage,
                 compound_count=library.compound_count,
-                target_has_cocrystal_ligand=intent.target_source == "rcsb",
+                target_has_cocrystal_ligand=target is not None and target.source == "rcsb",
             ),
             run_id=f"plan-{stage}",
         )
@@ -275,44 +401,7 @@ async def run_campaign(ctx: Context, node_input: CardTrigger) -> CampaignOutcome
                 )
             )
 
-        completed = CompletedStage(
-            triaged=triaged,
-            target_name=intent.target_name,
-            target_source=intent.target_source,
-            target_reference=intent.target_reference,
-        )
-        proposal_request = ProposalRequest.model_validate(
-            await ctx.run_node(
-                build_proposal_request, completed, run_id=f"propose-inputs-{stage}-{attempt}"
-            )
-        )
-        followup = ProposedFollowup(
-            note=unproposed_stage_note(proposal_request),
-            blocked_note=blocked_stages_note(proposal_request.blocked_next_stages),
-        )
-        if proposal_request.runnable_next_stages and proposal_request.carried_compounds:
-            proposal = StageProposal.model_validate(
-                await ctx.run_node(
-                    proposer_agent, proposal_request, run_id=f"propose-{stage}-{attempt}"
-                )
-            )
-            followup = ProposedFollowup.model_validate(
-                await ctx.run_node(
-                    create_recommended_card,
-                    ProposalDecision(
-                        completed=completed, request=proposal_request, proposal=proposal
-                    ),
-                    run_id=f"propose-card-{stage}-{attempt}",
-                )
-            )
-
-        return CampaignOutcome.model_validate(
-            await ctx.run_node(
-                complete_campaign_on_card,
-                CampaignCompletion(triaged=triaged, followup=followup),
-                run_id=f"complete-{stage}-{attempt}",
-            )
-        )
+        return await propose_follow_up_and_finish(ctx, card, intent, triaged, stage, attempt)
 
 
 cascade_campaign = Workflow(name="cascade_campaign", edges=[(START, run_campaign)])

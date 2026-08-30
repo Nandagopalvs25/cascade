@@ -3,10 +3,9 @@ import re
 from typing import get_args
 
 import pytest
-from pydantic import BaseModel
 
 from cascade.agents.prompts import INTAKE_INSTRUCTION
-from cascade.agents.schemas import CampaignIntent, Stage
+from cascade.agents.schemas import CampaignIntent
 from cascade.schemas import JobSpec, TargetStructure, Workload
 
 EXECUTABLE_WORKLOADS = ("dock", "admet", "md_stability", "cofold")
@@ -14,20 +13,6 @@ EXECUTABLE_WORKLOADS = ("dock", "admet", "md_stability", "cofold")
 
 def test_workload_covers_every_container_in_the_workloads_directory():
     assert get_args(Workload) == EXECUTABLE_WORKLOADS
-
-
-def test_stage_is_workload_plus_synthesis_and_stays_derived():
-    assert get_args(Stage) == (*get_args(Workload), "synthesis")
-
-
-def test_stage_serializes_as_a_flat_enum_for_gemini_output_schemas():
-    class Probe(BaseModel):
-        stage: Stage
-
-    schema = Probe.model_json_schema()["properties"]["stage"]
-
-    assert "anyOf" not in schema
-    assert schema["enum"] == list(get_args(Stage))
 
 
 @pytest.mark.parametrize("workload", EXECUTABLE_WORKLOADS)
@@ -111,7 +96,7 @@ def _objects_without_declared_properties(schema, path=""):
     return offenders
 
 
-@pytest.mark.parametrize("agent_name", ("intake", "planner", "triage", "proposer"))
+@pytest.mark.parametrize("agent_name", ("intake", "planner", "triage", "stage_decision"))
 def test_agent_output_schemas_declare_every_object_property(agent_name):
     from google.genai import _transformers
 
@@ -130,3 +115,62 @@ def test_planner_can_emit_every_parameter_the_instruction_describes():
     allowed = set().union(*ALLOWED_JOB_PARAMS_BY_WORKLOAD.values())
 
     assert set(WorkloadParams.model_fields) <= allowed
+
+
+def test_every_workload_declares_the_inputs_it_requires():
+    from cascade.agents.capabilities import STAGE_REQUIREMENTS
+
+    assert tuple(STAGE_REQUIREMENTS) == get_args(Workload)
+
+
+def test_every_workload_declares_what_it_produces():
+    from cascade.agents.capabilities import PRODUCED_FILE_NAMES_BY_WORKLOAD
+
+    assert tuple(PRODUCED_FILE_NAMES_BY_WORKLOAD) == get_args(Workload)
+
+
+def test_only_the_safety_screen_runs_without_a_protein():
+    from cascade.agents.capabilities import stage_requires_a_protein_structure
+
+    without_a_protein = [
+        workload
+        for workload in get_args(Workload)
+        if not stage_requires_a_protein_structure(workload)
+    ]
+
+    assert without_a_protein == ["admet"]
+
+
+def test_a_protein_sequence_can_be_derived_from_a_structure():
+    from cascade.agents.capabilities import (
+        InputKind,
+        inputs_available_after_derivation,
+        unmet_inputs_for_stage,
+    )
+
+    assert inputs_available_after_derivation(frozenset({InputKind.PROTEIN_STRUCTURE})) == frozenset(
+        {InputKind.PROTEIN_STRUCTURE, InputKind.PROTEIN_SEQUENCE}
+    )
+    assert (
+        unmet_inputs_for_stage(
+            "cofold", frozenset({InputKind.PROTEIN_STRUCTURE, InputKind.LIGAND_STRUCTURES})
+        )
+        == frozenset()
+    )
+
+
+def test_the_safety_screen_is_satisfied_by_compounds_alone():
+    from cascade.agents.capabilities import InputKind, unmet_inputs_for_stage
+
+    assert unmet_inputs_for_stage("admet", frozenset({InputKind.LIGAND_STRUCTURES})) == frozenset()
+    assert unmet_inputs_for_stage("dock", frozenset({InputKind.LIGAND_STRUCTURES})) == frozenset(
+        {InputKind.PROTEIN_STRUCTURE}
+    )
+
+
+def test_pose_stability_needs_both_a_receptor_and_poses():
+    from cascade.agents.capabilities import InputKind, unmet_inputs_for_stage
+
+    assert unmet_inputs_for_stage(
+        "md_stability", frozenset({InputKind.POSED_COMPLEXES})
+    ) == frozenset({InputKind.PROTEIN_STRUCTURE})

@@ -40,7 +40,7 @@ class JobSpec(BaseModel):
 
     run_id: str
     workload: Workload
-    target: TargetStructure
+    target: TargetStructure | None = None
     ligands_uri: str
     binding_site: BindingSite | None = None
     params: dict = Field(default_factory=dict)
@@ -65,3 +65,12 @@ class DockingParams(BaseModel):
     @classmethod
     def from_job_spec(cls, spec: JobSpec) -> "DockingParams":
         return cls.model_validate(spec.params)
+
+
+def require_target_structure(spec: JobSpec) -> TargetStructure:
+    if spec.target is None:
+        raise ValueError(
+            f"the {spec.workload} container needs a protein structure, but the job spec carries "
+            "none"
+        )
+    return spec.target

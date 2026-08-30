@@ -1,19 +1,17 @@
-import json
 import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
 
-from google.cloud import pubsub_v1, storage
-
+from artifacts import ArtifactStore, publish_job_completion
 from docking import (
     LigandDockingResult,
     convert_receptor_pdb_to_pdbqt,
     dock_prepared_ligands,
     pose_rmsd_by_mode,
 )
-from job_spec import DockingParams, JobSpec
+from job_spec import DockingParams, JobSpec, require_target_structure
 from ligands import (
     LigandFailure,
     LigandRecord,
@@ -31,6 +29,7 @@ from results import (
     ReceptorSummary,
     build_run_summary,
     write_best_pose_files,
+    write_combined_poses_sdf,
     write_reference_ligand_pdb,
     write_results_archive,
     write_run_summary,
@@ -49,63 +48,7 @@ LOGGER = logging.getLogger("cascade.dock")
 
 SPEC_URI_ENVIRONMENT_VARIABLE = "SPEC_URI"
 RUN_ID_ENVIRONMENT_VARIABLE = "RUN_ID"
-PROJECT_ENVIRONMENT_VARIABLE = "GCP_PROJECT"
-TOPIC_ENVIRONMENT_VARIABLE = "PUBSUB_TOPIC"
-GCS_URI_SCHEME = "gs://"
-PUBLISH_TIMEOUT_SECONDS = 60
-
-
-class ArtifactStore:
-    def __init__(self) -> None:
-        self._storage_client: storage.Client | None = None
-
-    def _client(self) -> storage.Client:
-        if self._storage_client is None:
-            self._storage_client = storage.Client()
-        return self._storage_client
-
-    @staticmethod
-    def _split_gcs_uri(uri: str) -> tuple[str, str]:
-        bucket_name, _, object_path = uri.removeprefix(GCS_URI_SCHEME).partition("/")
-        if not bucket_name or not object_path:
-            raise ValueError(f"GCS URI missing bucket or object path: {uri}")
-        return bucket_name, object_path
-
-    def read_text(self, uri: str) -> str:
-        if uri.startswith(GCS_URI_SCHEME):
-            bucket_name, object_path = self._split_gcs_uri(uri)
-            return self._client().bucket(bucket_name).blob(object_path).download_as_text()
-        return Path(uri).read_text()
-
-    def download_to_file(self, uri: str, destination: Path) -> Path:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if uri.startswith(GCS_URI_SCHEME):
-            bucket_name, object_path = self._split_gcs_uri(uri)
-            self._client().bucket(bucket_name).blob(object_path).download_to_filename(
-                str(destination)
-            )
-        else:
-            destination.write_bytes(Path(uri).read_bytes())
-        return destination
-
-    def upload_file(self, source: Path, uri: str) -> str:
-        if uri.startswith(GCS_URI_SCHEME):
-            bucket_name, object_path = self._split_gcs_uri(uri)
-            self._client().bucket(bucket_name).blob(object_path).upload_from_filename(str(source))
-        else:
-            destination = Path(uri)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(source.read_bytes())
-        return uri
-
-    def upload_directory(self, directory: Path, prefix_uri: str) -> list[str]:
-        prefix = prefix_uri.rstrip("/")
-        uploaded: list[str] = []
-        for path in sorted(directory.rglob("*")):
-            if path.is_file():
-                relative = path.relative_to(directory).as_posix()
-                uploaded.append(self.upload_file(path, f"{prefix}/{relative}"))
-        return uploaded
+WORKLOAD = "dock"
 
 
 def configure_logging() -> None:
@@ -118,7 +61,7 @@ def configure_logging() -> None:
 
 def read_job_spec(store: ArtifactStore, spec_uri: str) -> JobSpec:
     spec = JobSpec.model_validate_json(store.read_text(spec_uri))
-    if spec.workload != "dock":
+    if spec.workload != WORKLOAD:
         raise ValueError(f"the dock container cannot run workload {spec.workload!r}")
     return spec
 
@@ -226,24 +169,52 @@ def measure_control_compound(
     return summary
 
 
-def publish_job_completion(payload: dict) -> None:
-    project_id = os.environ.get(PROJECT_ENVIRONMENT_VARIABLE)
-    topic_name = os.environ.get(TOPIC_ENVIRONMENT_VARIABLE)
-    if not project_id or not topic_name:
-        LOGGER.warning(
-            "skipping completion publish: %s and %s must both be set",
-            PROJECT_ENVIRONMENT_VARIABLE,
-            TOPIC_ENVIRONMENT_VARIABLE,
-        )
-        return
-    publisher = pubsub_v1.PublisherClient()
-    topic_path = publisher.topic_path(project_id, topic_name)
-    future = publisher.publish(topic_path, json.dumps(payload).encode())
-    future.result(timeout=PUBLISH_TIMEOUT_SECONDS)
-    LOGGER.info("published completion for run %s to %s", payload.get("run_id"), topic_path)
+def docking_completion_payload(
+    spec: JobSpec,
+    summary: dict,
+    binding_site_origin: str,
+    ligands_docked: int,
+    ligands_failed: int,
+    output_prefix: str,
+    results_archive_uri: str,
+) -> dict:
+    best = summary["scores"][0]
+    analysis = summary["score_analysis"] or {}
+    return {
+        "run_id": spec.run_id,
+        "workload": spec.workload,
+        "status": "succeeded",
+        "exit_code": 0,
+        "results_uri": output_prefix,
+        "results_manifest_uri": f"{output_prefix}/{RESULTS_FILE_NAME}",
+        "results_archive_uri": results_archive_uri,
+        "summary": {
+            "ligands_docked": ligands_docked,
+            "ligands_failed": ligands_failed,
+            "best_compound_id": best["compound_id"],
+            "best_affinity_kcal_per_mol": best["best_affinity_kcal_per_mol"],
+            "binding_site_origin": binding_site_origin,
+            "control_compound": summary["control_compound"],
+            "score_analysis": {
+                "scoring_function_error_kcal_per_mol": analysis.get(
+                    "scoring_function_error_kcal_per_mol"
+                ),
+                "ranking_separates_best_compound": analysis.get("ranking_separates_best_compound"),
+                "compounds_indistinguishable_from_best_count": len(
+                    analysis.get("compounds_indistinguishable_from_best", [])
+                ),
+                "ranking_is_size_driven": analysis.get("ranking_is_size_driven"),
+                "affinity_heavy_atom_correlation": analysis.get("affinity_heavy_atom_correlation"),
+                "metrics_agree_on_best_compound": analysis.get("metrics_agree_on_best_compound"),
+                "best_by_ligand_efficiency": analysis.get("best_by_ligand_efficiency"),
+                "control_affinity_rank": analysis.get("control_affinity_rank"),
+            },
+        },
+    }
 
 
 def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dict:
+    require_target_structure(spec)
     params = DockingParams.from_job_spec(spec)
     LOGGER.info(
         "run %s: docking against %s with exhaustiveness %s",
@@ -346,6 +317,7 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
     outputs_directory.mkdir(parents=True, exist_ok=True)
     write_scores_csv(results, outputs_directory)
     write_best_pose_files(results, outputs_directory)
+    write_combined_poses_sdf(results, outputs_directory)
     if cocrystal_ligand is not None:
         write_reference_ligand_pdb(cocrystal_ligand.to_pdb_block(), outputs_directory)
     summary = build_run_summary(spec, params, receptor, site, control, results, failures)
@@ -358,7 +330,6 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
     archive_path = write_results_archive(outputs_directory, workspace)
     results_archive_uri = store.upload_file(archive_path, f"{output_prefix}/{RESULTS_ARCHIVE_NAME}")
 
-    best = summary["scores"][0]
     analysis = summary["score_analysis"] or {}
     LOGGER.info(
         "run %s: score analysis separates_best=%s size_driven=%s correlation=%s "
@@ -369,37 +340,9 @@ def run_docking_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dic
         analysis.get("affinity_heavy_atom_correlation"),
         len(analysis.get("compounds_indistinguishable_from_best", [])),
     )
-    return {
-        "run_id": spec.run_id,
-        "workload": spec.workload,
-        "status": "succeeded",
-        "exit_code": 0,
-        "results_uri": output_prefix,
-        "results_manifest_uri": f"{output_prefix}/{RESULTS_FILE_NAME}",
-        "results_archive_uri": results_archive_uri,
-        "summary": {
-            "ligands_docked": len(results),
-            "ligands_failed": len(failures),
-            "best_compound_id": best["compound_id"],
-            "best_affinity_kcal_per_mol": best["best_affinity_kcal_per_mol"],
-            "binding_site_origin": site.origin,
-            "control_compound": summary["control_compound"],
-            "score_analysis": {
-                "scoring_function_error_kcal_per_mol": analysis.get(
-                    "scoring_function_error_kcal_per_mol"
-                ),
-                "ranking_separates_best_compound": analysis.get("ranking_separates_best_compound"),
-                "compounds_indistinguishable_from_best_count": len(
-                    analysis.get("compounds_indistinguishable_from_best", [])
-                ),
-                "ranking_is_size_driven": analysis.get("ranking_is_size_driven"),
-                "affinity_heavy_atom_correlation": analysis.get("affinity_heavy_atom_correlation"),
-                "metrics_agree_on_best_compound": analysis.get("metrics_agree_on_best_compound"),
-                "best_by_ligand_efficiency": analysis.get("best_by_ligand_efficiency"),
-                "control_affinity_rank": analysis.get("control_affinity_rank"),
-            },
-        },
-    }
+    return docking_completion_payload(
+        spec, summary, site.origin, len(results), len(failures), output_prefix, results_archive_uri
+    )
 
 
 def main() -> int:
@@ -421,7 +364,7 @@ def main() -> int:
         publish_job_completion(
             {
                 "run_id": run_id,
-                "workload": "dock",
+                "workload": WORKLOAD,
                 "status": "failed",
                 "exit_code": 1,
                 "error_type": type(error).__name__,

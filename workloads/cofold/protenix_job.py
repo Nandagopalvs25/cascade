@@ -11,7 +11,6 @@ LOGGER = logging.getLogger("cascade.cofold.protenix")
 
 PROTENIX_EXECUTABLE = "protenix"
 INPUT_FILE_NAME = "protenix_input.json"
-PREDICTIONS_DIRECTORY_NAME = "predictions"
 STRUCTURE_SUFFIX = ".cif"
 SUMMARY_CONFIDENCE_MARKER = "_summary_confidence_sample_"
 

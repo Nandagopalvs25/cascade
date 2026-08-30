@@ -2,18 +2,23 @@ from google.adk.agents import Agent
 from google.adk.models.google_llm import Gemini
 from google.genai import types
 
+from cascade.agents.decision_tools import (
+    read_previous_stage_compound_measurements,
+    read_previous_stage_conclusion,
+    read_previous_stage_request_card,
+)
 from cascade.agents.prompts import (
     INTAKE_INSTRUCTION,
     PLANNER_INSTRUCTION,
-    PROPOSER_INSTRUCTION,
+    STAGE_DECISION_INSTRUCTION,
     TRIAGE_INSTRUCTION,
 )
 from cascade.agents.schemas import (
     CampaignIntent,
     CardInputs,
     PlanRequest,
-    ProposalRequest,
-    StageProposal,
+    StageDecision,
+    StageDecisionRequest,
     TriageRequest,
     TriageVerdict,
     WorkloadPlan,
@@ -80,15 +85,21 @@ triage_agent = Agent(
 )
 
 
-proposer_agent = Agent(
-    name="proposer",
+stage_decision_agent = Agent(
+    name="stage_decision",
     model=build_gemini_model(settings.gemini_model),
     mode="single_turn",
     description=(
-        "Decides what stage should follow a finished one and writes the card that proposes it."
+        "Decides which computational stage CASCADE runs next, or that it runs none, and writes "
+        "the card that proposes it."
     ),
-    instruction=PROPOSER_INSTRUCTION,
+    instruction=STAGE_DECISION_INSTRUCTION,
     generate_content_config=REASONING_KEPT_OUT_OF_OUTPUT_FIELDS,
-    input_schema=ProposalRequest,
-    output_schema=StageProposal,
+    input_schema=StageDecisionRequest,
+    output_schema=StageDecision,
+    tools=[
+        read_previous_stage_conclusion,
+        read_previous_stage_compound_measurements,
+        read_previous_stage_request_card,
+    ],
 )

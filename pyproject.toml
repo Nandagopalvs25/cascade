@@ -36,7 +36,7 @@ packages = ["src/cascade"]
 line-length = 100
 target-version = "py312"
 extend-exclude = ["migrations", "*.md"]
-src = ["src", "workloads/admet", "workloads/cofold", "workloads/dock"]
+src = ["src", "workloads/admet", "workloads/cofold", "workloads/dock", "workloads/md_stability"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

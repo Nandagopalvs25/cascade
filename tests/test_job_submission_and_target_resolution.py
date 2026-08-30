@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from cascade.clients.jobs import CloudRunJobClient, workload_job_resource_name
+from cascade.clients.jobs import (
+    CloudRunJobClient,
+    cloud_run_region_for_workload,
+    workload_job_resource_name,
+)
 from cascade.clients.structures import CampaignInputResolver
 from cascade.schemas import JobSpec, TargetRequest, TargetStructure
 
@@ -78,6 +82,30 @@ def test_job_name_is_derived_from_the_workload(settings_override):
         "projects/test-project/locations/us-central1/jobs/cascade-dock"
     )
     assert workload_job_resource_name("admet", settings_override).endswith("/jobs/cascade-admet")
+
+
+def test_gpu_accelerated_workloads_are_submitted_to_the_gpu_region(settings_override):
+    settings = settings_override.model_copy(update={"gcp_gpu_region": "europe-west1"})
+
+    assert cloud_run_region_for_workload("md_stability", settings) == "europe-west1"
+    assert cloud_run_region_for_workload("dock", settings) == "us-central1"
+    assert workload_job_resource_name("md_stability", settings) == (
+        "projects/test-project/locations/europe-west1/jobs/cascade-md-stability"
+    )
+
+
+def test_the_gpu_region_is_the_only_thing_that_differs_from_a_cpu_workload_submission(
+    settings_override,
+):
+    settings = settings_override.model_copy(update={"gcp_gpu_region": "europe-west1"})
+    gcs = RecordingGCS()
+    spec = _job_spec().model_copy(update={"workload": "md_stability"})
+
+    _, request = _submit(spec, gcs, settings)
+
+    assert request.name == (
+        "projects/test-project/locations/europe-west1/jobs/cascade-md-stability"
+    )
 
 
 def test_submission_overrides_carry_both_spec_uri_and_run_id(settings_override):
@@ -258,3 +286,18 @@ def test_real_smiles_survive_the_filter(smiles):
     kept, skipped = smiles_library_lines_from_text(f"{smiles} compound")
     assert kept == [f"{smiles}\tcompound"]
     assert skipped == 0
+
+
+def test_cloud_run_job_names_never_contain_an_underscore():
+    import re
+    from typing import get_args
+
+    from cascade.clients.jobs import cloud_run_job_name_for_workload
+    from cascade.schemas import Workload
+
+    cloud_run_name = re.compile(r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+    for workload in get_args(Workload):
+        name = cloud_run_job_name_for_workload(workload)
+        assert cloud_run_name.match(name), f"{workload} produced invalid job name {name}"
+
+    assert cloud_run_job_name_for_workload("md_stability") == "cascade-md-stability"

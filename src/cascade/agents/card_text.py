@@ -1,6 +1,6 @@
 import re
 
-from cascade.agents.compound_library import smiles_library_lines_from_text
+from cascade.agents.compound_library import smiles_subset_for_compounds
 from cascade.agents.policy import (
     allowed_job_params_for_workload,
     executor_for_workload,
@@ -21,10 +21,14 @@ STAGE_COST_ESTIMATES = {
     "dock": ("$0.05", "~5 min"),
     "admet": ("$0.02", "~1 min"),
     "cofold": ("$0.40", "~15 min"),
-    "md_stability": ("$0.40", "~15 min"),
+    "md_stability": ("$0.20", "~6 min"),
 }
 
-EXECUTOR_LABELS = {"cloud_run_job": "Cloud Run Job", "cloud_batch": "Cloud Batch, spot GPU"}
+EXECUTOR_LABELS = {
+    "cloud_run_job": "Cloud Run Job",
+    "cloud_run_gpu_job": "Cloud Run Job, NVIDIA L4 GPU",
+    "cloud_batch": "Cloud Batch, spot GPU",
+}
 
 PROPOSED_FROM_RUN_PATTERN = re.compile(r"from run `([0-9a-fA-F-]{36})`")
 
@@ -34,6 +38,10 @@ MODEL_TALKING_TO_ITSELF_PATTERN = re.compile(
     r"^(wait|let's|let us|ok|okay|done|perfect|adjusting|ready to output|no further text)\b",
     re.IGNORECASE,
 )
+
+CARD_TITLE_TARGET_SEPARATOR = " · "
+
+NO_TARGET_CARD_TITLE_LABEL = "No target"
 
 MAXIMUM_AGENT_PROSE_SENTENCES = 4
 
@@ -154,10 +162,21 @@ def cofold_headline(summary: dict) -> str:
     )
 
 
+def md_stability_headline(summary: dict) -> str:
+    return (
+        f"{summary.get('poses_simulated', 'unknown')} docked pose(s) re-simulated for "
+        f"{summary.get('production_picoseconds', 'unknown')} ps on "
+        f"{summary.get('platform', 'CPU')}; "
+        f"{summary.get('stable', 0)} held their pose, {summary.get('drifted', 0)} drifted, "
+        f"{summary.get('unstable', 0)} left the pocket"
+    )
+
+
 HEADLINE_BY_WORKLOAD = {
     "dock": docking_headline,
     "admet": admet_headline,
     "cofold": cofold_headline,
+    "md_stability": md_stability_headline,
 }
 
 
@@ -250,16 +269,11 @@ def estimated_stage_cost_line(workload: str, compound_count: int) -> str:
 
 
 def library_lines_for_compounds(library_text: str, compound_names: list[str]) -> list[str]:
-    lines, _ = smiles_library_lines_from_text(library_text)
-    by_name = {}
-    for line in lines:
-        smiles, _, name = line.partition("\t")
-        by_name[name.strip().lower()] = (smiles, name.strip())
+    subset, _ = smiles_subset_for_compounds(library_text, compound_names)
     rendered = []
-    for compound_name in compound_names:
-        entry = by_name.get(compound_name.strip().lower())
-        if entry is not None:
-            rendered.append(f"`{entry[0]}` {entry[1]}")
+    for line in subset.splitlines():
+        smiles, _, name = line.partition("\t")
+        rendered.append(f"`{smiles}` {name}")
     return rendered
 
 
@@ -283,17 +297,44 @@ def target_description_line(completed: CompletedStage) -> str:
     return f"**Target.** {named} ({completed.target_source} {completed.target_reference})"
 
 
+def campaign_target_label(completed: CompletedStage) -> str:
+    if completed.target_source == "rcsb" and completed.target_reference:
+        return completed.target_reference.upper()
+    return completed.target_name or NO_TARGET_CARD_TITLE_LABEL
+
+
+def proposed_card_title(completed: CompletedStage, card_title: str) -> str:
+    label = campaign_target_label(completed)
+    if card_title.casefold().startswith(label.casefold()):
+        return card_title
+    return f"{label}{CARD_TITLE_TARGET_SEPARATOR}{card_title}"
+
+
+def carried_compound_name_line(request: ProposalRequest) -> str:
+    return ", ".join(f"`{judgement.compound_id}`" for judgement in request.carried_compounds)
+
+
+def structures_resolved_from_lineage_note() -> str:
+    return (
+        "Their structures are not written out here because the run below stored them in a format "
+        "this card cannot display. CASCADE reads them back from that run's compound library when "
+        "this card runs."
+    )
+
+
 def proposed_card_description(
     node_input: ProposalDecision, library_lines: list[str], parent_run_id: str
 ) -> str:
     request = node_input.request
     reason = " ".join(node_input.proposal.reason.split())
+    compound_count = len(library_lines) or len(request.carried_compounds)
     sections = [
         target_description_line(node_input.completed),
         f"**Why.** {reason}",
-        estimated_stage_cost_line(node_input.proposal.next_stage, len(library_lines)),
-        carried_compound_framing(request, len(library_lines)),
-        "\n".join(library_lines),
+        estimated_stage_cost_line(node_input.proposal.next_stage, compound_count),
+        carried_compound_framing(request, compound_count),
+        "\n".join(library_lines) if library_lines else carried_compound_name_line(request),
+        "" if library_lines else structures_resolved_from_lineage_note(),
         f"**Proposed by CASCADE** from run `{parent_run_id}` "
         f"({request.completed_stage}). Drag to To Do to run it.",
     ]

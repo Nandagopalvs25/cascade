@@ -1,12 +1,14 @@
 import uuid
 from datetime import UTC, datetime
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cascade.agents.schemas import LineageRun, PreviousStageSummary
 from cascade.db import async_session
 from cascade.models import Artifact, Decision, Job, JobState, Run, RunState
-from cascade.schemas import JobSpec
+from cascade.schemas import JobSpec, TargetStructure
 
 
 def job_interrupt_id(run_id: str, attempt: int) -> str:
@@ -163,11 +165,20 @@ async def record_decision(
         await session.commit()
 
 
-async def workloads_already_run_in_lineage(run_id: str) -> dict[str, str]:
+def target_structure_recorded_in_run_spec(spec: dict | None) -> TargetStructure | None:
+    if not spec or not spec.get("target"):
+        return None
+    try:
+        return TargetStructure.model_validate(spec["target"])
+    except ValidationError:
+        return None
+
+
+async def runs_in_lineage(run_id: str) -> list[LineageRun]:
     run_uuid = parsed_run_uuid(run_id)
     if run_uuid is None:
-        return {}
-    already_run: dict[str, str] = {}
+        return []
+    lineage: list[LineageRun] = []
     visited: set[uuid.UUID] = set()
     async with async_session() as session:
         while run_uuid is not None and run_uuid not in visited:
@@ -175,6 +186,71 @@ async def workloads_already_run_in_lineage(run_id: str) -> dict[str, str]:
             run = await session.get(Run, run_uuid)
             if run is None:
                 break
-            already_run.setdefault(run.workload, str(run.id))
+            lineage.append(
+                LineageRun(
+                    run_id=str(run.id),
+                    workload=run.workload,
+                    state=str(run.state),
+                    target=target_structure_recorded_in_run_spec(run.spec),
+                    ligands_uri=(run.spec or {}).get("ligands_uri"),
+                )
+            )
             run_uuid = run.parent_run_id
-    return already_run
+    return lineage
+
+
+async def load_results_prefix_for_run(run_id: str) -> str | None:
+    run_uuid = parsed_run_uuid(run_id)
+    if run_uuid is None:
+        return None
+    async with async_session() as session:
+        result = await session.execute(
+            select(Artifact.gcs_uri)
+            .where(Artifact.run_id == run_uuid, Artifact.kind == "results_prefix")
+            .order_by(Artifact.created_at.desc())
+        )
+        return result.scalars().first()
+
+
+async def load_run_workload_and_card_id(run_id: str) -> dict | None:
+    run_uuid = parsed_run_uuid(run_id)
+    if run_uuid is None:
+        return None
+    async with async_session() as session:
+        run = await session.get(Run, run_uuid)
+        if run is None:
+            return None
+        return {"workload": run.workload, "card_id": run.trello_card_id}
+
+
+async def load_triage_decision_for_run(run_id: str) -> dict | None:
+    run_uuid = parsed_run_uuid(run_id)
+    if run_uuid is None:
+        return None
+    async with async_session() as session:
+        result = await session.execute(
+            select(Decision.rationale, Decision.inputs, Decision.output)
+            .where(Decision.run_id == run_uuid, Decision.agent == "triage")
+            .order_by(Decision.created_at.desc())
+        )
+        row = result.first()
+        if row is None:
+            return None
+        return {"rationale": row[0], "inputs": row[1], "output": row[2]}
+
+
+async def load_lineage_run_summaries(run_id: str) -> list[PreviousStageSummary]:
+    summaries: list[PreviousStageSummary] = []
+    for ancestor in await runs_in_lineage(run_id):
+        verdict = (await load_triage_decision_for_run(ancestor.run_id) or {}).get("output") or {}
+        summaries.append(
+            PreviousStageSummary(
+                run_id=ancestor.run_id,
+                workload=ancestor.workload,
+                state=ancestor.state,
+                headline=verdict.get("headline"),
+                run_is_trustworthy=verdict.get("run_is_trustworthy"),
+                results_discriminate=verdict.get("results_discriminate"),
+            )
+        )
+    return summaries

@@ -28,14 +28,6 @@ def run_outputs_prefix(run_id: str, attempt: int = 1) -> str:
     return f"runs/{run_id}/outputs_attempt{attempt}"
 
 
-def run_reports_prefix(run_id: str) -> str:
-    return f"runs/{run_id}/reports"
-
-
-def run_figures_prefix(run_id: str) -> str:
-    return f"runs/{run_id}/figures"
-
-
 def split_gcs_uri(uri: str) -> tuple[str, str]:
     if not uri.startswith(GCS_URI_SCHEME):
         raise ValueError(f"not a GCS URI: {uri}")
@@ -62,10 +54,6 @@ class GCSClient:
         self._signing_credentials = None
         self._signing_credentials_lock = threading.Lock()
 
-    @property
-    def bucket_name(self) -> str:
-        return self._bucket.name
-
     def uri_for_path(self, path: str) -> str:
         return f"{GCS_URI_SCHEME}{self._bucket.name}/{path}"
 
@@ -84,13 +72,6 @@ class GCSClient:
             return self.uri_for_path(path)
 
         return await asyncio.to_thread(upload_bytes_blob)
-
-    async def download_json(self, path: str) -> dict:
-        def download_json_blob() -> dict:
-            blob = self._bucket.blob(path)
-            return json.loads(blob.download_as_text())
-
-        return await asyncio.to_thread(download_json_blob)
 
     async def download_json_from_uri(self, uri: str) -> dict:
         bucket_name, object_path = split_gcs_uri(uri)
@@ -122,46 +103,30 @@ class GCSClient:
                 return None
             return email, credentials.token
 
-    def _generate_signed_get_url_for_blob(
-        self, blob, expiration_minutes: int, response_disposition: str | None
-    ) -> str:
-        signing_identity = self._resolve_iam_signing_identity()
-        delegated_signing = (
-            {
-                "service_account_email": signing_identity[0],
-                "access_token": signing_identity[1],
-            }
-            if signing_identity
-            else {}
-        )
-        return blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=expiration_minutes),
-            method="GET",
-            response_disposition=response_disposition,
-            **delegated_signing,
-        )
-
     async def generate_signed_url_for_uri(
         self, uri: str, expiration_minutes: int = 60, download_filename: str | None = None
     ) -> str:
         bucket_name, object_path = split_gcs_uri(uri)
 
         def sign_blob_url_in_bucket() -> str:
-            blob = self._client.bucket(bucket_name).blob(object_path)
-            response_disposition = (
-                f'attachment; filename="{download_filename}"' if download_filename else None
+            signing_identity = self._resolve_iam_signing_identity()
+            delegated_signing = (
+                {
+                    "service_account_email": signing_identity[0],
+                    "access_token": signing_identity[1],
+                }
+                if signing_identity
+                else {}
             )
-            return self._generate_signed_get_url_for_blob(
-                blob, expiration_minutes, response_disposition
+            blob = self._client.bucket(bucket_name).blob(object_path)
+            return blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(minutes=expiration_minutes),
+                method="GET",
+                response_disposition=(
+                    f'attachment; filename="{download_filename}"' if download_filename else None
+                ),
+                **delegated_signing,
             )
 
         return await asyncio.to_thread(sign_blob_url_in_bucket)
-
-    async def generate_signed_url(self, path: str, expiration_minutes: int = 60) -> str:
-        def sign_blob_url() -> str:
-            return self._generate_signed_get_url_for_blob(
-                self._bucket.blob(path), expiration_minutes, None
-            )
-
-        return await asyncio.to_thread(sign_blob_url)

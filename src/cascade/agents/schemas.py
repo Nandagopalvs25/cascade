@@ -1,12 +1,14 @@
-from typing import Literal, get_args
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cascade.agents.capabilities import InputKind
 from cascade.schemas import BindingSite, TargetSource, TargetStructure, Workload
 
-Stage = Literal[*get_args(Workload), "synthesis"]
-LigandSource = Literal["attachment", "smiles_in_text", "url"]
-Executor = Literal["cloud_run_job", "cloud_batch"]
+LigandSource = Literal[
+    "attachment", "smiles_in_text", "url", "parent_run_poses", "parent_run_library"
+]
+Executor = Literal["cloud_run_job", "cloud_run_gpu_job", "cloud_batch"]
 QualityHint = Literal["fast", "standard", "thorough"]
 ControlVerdict = Literal["passed", "pose_sampled_not_top_ranked", "failed", "not_measured"]
 TriageDisposition = Literal["promote", "hold", "reject"]
@@ -48,17 +50,17 @@ class CampaignState(BaseModel):
     completed_workload: Workload | None = None
 
 
+class LineageRun(BaseModel):
+    run_id: str
+    workload: str
+    state: str
+    target: TargetStructure | None = None
+    ligands_uri: str | None = None
+
+
 class IntakeAnnouncement(BaseModel):
     card_id: str
     intent: CampaignIntent
-
-
-class LigandRequest(BaseModel):
-    run_id: str
-    card_id: str
-    source: LigandSource
-    reference: str
-    card_description: str
 
 
 class LigandLibrary(BaseModel):
@@ -67,6 +69,27 @@ class LigandLibrary(BaseModel):
     source: LigandSource
     compound_names: list[str] = Field(default_factory=list)
     skipped_lines: int = 0
+
+
+class UnmetRequirement(BaseModel):
+    kind: InputKind
+    question: str
+
+
+class StageInputRequest(BaseModel):
+    run_id: str
+    card_id: str
+    stage: Workload
+    intent: CampaignIntent
+    card_description: str
+    attachment_names: list[str] = Field(default_factory=list)
+    parent_run_id: str | None = None
+
+
+class ResolvedStageInputs(BaseModel):
+    library: LigandLibrary | None = None
+    target: TargetStructure | None = None
+    unmet: list[UnmetRequirement] = Field(default_factory=list)
 
 
 class PlanRequest(BaseModel):
@@ -92,6 +115,13 @@ class WorkloadParams(BaseModel):
     samples_per_seed: int | None = Field(default=None, ge=1, le=25)
     max_complexes: int | None = Field(default=None, ge=1, le=64)
     use_msa: bool | None = None
+    equilibration_steps: int | None = Field(default=None, ge=0, le=500_000)
+    production_steps: int | None = Field(default=None, ge=1000, le=5_000_000)
+    timestep_femtoseconds: float | None = Field(default=None, ge=0.5, le=4.0)
+    temperature_kelvin: float | None = Field(default=None, ge=100.0, le=400.0)
+    frames_recorded: int | None = Field(default=None, ge=5, le=1000)
+    pose_drift_threshold_angstrom: float | None = Field(default=None, ge=0.5, le=10.0)
+    contact_retention_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class WorkloadPlan(BaseModel):
@@ -111,7 +141,7 @@ class JobLaunch(BaseModel):
     workload: Workload
     attempt: int = 1
     plan: WorkloadPlan
-    target: TargetStructure
+    target: TargetStructure | None = None
     library: LigandLibrary
     executor: Executor
     parent_run_id: str | None = None
@@ -197,6 +227,36 @@ class TriagedJobResult(BaseModel):
     control: ControlCheck
 
 
+StageDecisionPoint = Literal["first_stage", "next_stage"]
+
+
+class StageInputStatus(BaseModel):
+    kind: InputKind
+    resolves: bool
+
+
+class StageInputReadiness(BaseModel):
+    stage: Workload
+    inputs_resolve: bool
+    inputs: list[StageInputStatus] = Field(default_factory=list)
+    blocking_reason: str | None = None
+    already_run_as: str | None = None
+
+
+class PreviousStageSummary(BaseModel):
+    run_id: str
+    workload: str
+    state: str
+    headline: str | None = None
+    run_is_trustworthy: bool | None = None
+    results_discriminate: bool | None = None
+
+
+class RejectedStageChoice(BaseModel):
+    stage: Workload
+    reason: str
+
+
 class BlockedStage(BaseModel):
     workload: Workload
     reason: str
@@ -234,6 +294,54 @@ class ProposalDecision(BaseModel):
     proposal: StageProposal
 
 
+class StageDecisionRequest(BaseModel):
+    decision_point: StageDecisionPoint
+    card_title: str
+    card_description: str
+    intent: CampaignIntent
+    compound_count: int
+    campaign_history: list[PreviousStageSummary] = Field(default_factory=list)
+    stage_readiness: list[StageInputReadiness] = Field(default_factory=list)
+    completed_stage: Workload | None = None
+    completed_run_id: str | None = None
+    triage_headline: str | None = None
+    run_is_trustworthy: bool | None = None
+    results_discriminate: bool | None = None
+    carried_compounds: list[CompoundJudgement] = Field(default_factory=list)
+    carried_disposition: TriageDisposition | None = None
+    rejected_choices: list[RejectedStageChoice] = Field(default_factory=list)
+    choices_remaining: int = 1
+
+
+class StageDecision(BaseModel):
+    chosen_stage: Workload | None = None
+    question_it_answers: str
+    card_title: str
+    reason: str
+    rationale: str
+
+
+class StageDecisionInputs(BaseModel):
+    decision_point: StageDecisionPoint
+    card: CardInputs
+    intent: CampaignIntent
+    parent_run_id: str | None = None
+    attachment_names: list[str] = Field(default_factory=list)
+    completed: CompletedStage | None = None
+
+
+class StageDecisionRecord(BaseModel):
+    run_id: str
+    request: StageDecisionRequest
+    decision: StageDecision
+
+
+class NoStageChosen(BaseModel):
+    campaign_id: str
+    card_id: str
+    decision: StageDecision
+
+
 class ProposedFollowup(BaseModel):
     next_stage: Workload | None = None
     created_card_id: str | None = None
@@ -256,19 +364,16 @@ class StageOutcome(BaseModel):
 
 class CampaignOutcome(BaseModel):
     status: Literal[
-        "acknowledged",
         "needs_clarification",
         "duplicate",
         "already_complete",
         "needs_attention",
-        "submitted",
         "completed",
         "failed",
         "unsupported_executor",
     ]
     campaign_id: str
     card_id: str
-    target_name: str | None = None
     rationale: str
 
 

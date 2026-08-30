@@ -10,11 +10,11 @@ class Settings(BaseSettings):
 
     gcp_project_id: str
     gcp_region: str = "us-central1"
+    gcp_gpu_region: str = "europe-west1"
     gcs_bucket: str
     pubsub_push_service_account: str
     pubsub_push_audience: str
     pubsub_card_events_topic: str = "card-events"
-    pubsub_job_completions_topic: str = "job-completions"
 
     trello_api_key: str
     trello_api_token: str
@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     control_rmsd_threshold_angstrom: float = 2.0
     control_rerun_conformers_per_ligand: int = 8
     max_job_attempts: int = 2
+    max_model_reflect_retries: int = 2
+    max_stage_decision_attempts: int = 2
 
 
 @lru_cache(maxsize=1)

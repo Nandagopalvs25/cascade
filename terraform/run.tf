@@ -21,6 +21,10 @@ resource "google_cloud_run_v2_service" "cascade" {
         value = var.region
       }
       env {
+        name  = "CASCADE_GCP_GPU_REGION"
+        value = var.gpu_region
+      }
+      env {
         name  = "CASCADE_GCS_BUCKET"
         value = google_storage_bucket.artifacts.name
       }

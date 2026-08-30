@@ -6,10 +6,8 @@ import pytest
 
 from cascade.clients.gcs import (
     GCSClient,
-    run_figures_prefix,
     run_inputs_prefix,
     run_outputs_prefix,
-    run_reports_prefix,
     run_spec_path,
     split_gcs_uri,
 )
@@ -158,8 +156,6 @@ def test_target_requires_the_structure_to_be_resolved_into_gcs(unresolved_uri):
 def test_run_paths_match_the_documented_bucket_layout():
     assert run_spec_path("run-1") == "runs/run-1/spec.json"
     assert run_inputs_prefix("run-1") == "runs/run-1/inputs"
-    assert run_reports_prefix("run-1") == "runs/run-1/reports"
-    assert run_figures_prefix("run-1") == "runs/run-1/figures"
 
 
 def test_run_outputs_prefix_separates_retry_attempts():
@@ -226,13 +222,6 @@ def test_upload_bytes_passes_through_content_type(gcs_client_with_mock_bucket):
     )
 
 
-def test_download_json_parses_blob_contents(gcs_client_with_mock_bucket):
-    client, bucket = gcs_client_with_mock_bucket
-    bucket.blob.return_value.download_as_text.return_value = '{"workload": "dock"}'
-
-    assert asyncio.run(client.download_json("runs/run-1/spec.json")) == {"workload": "dock"}
-
-
 def test_download_json_from_uri_reads_the_bucket_named_in_the_uri(gcs_client_with_mock_bucket):
     client, _ = gcs_client_with_mock_bucket
     other_bucket = MagicMock()
@@ -261,17 +250,20 @@ def test_download_text_from_uri_reads_the_bucket_named_in_the_uri(gcs_client_wit
     other_bucket.blob.assert_called_once_with("runs/run-9/inputs/ligands.smi")
 
 
-def test_generate_signed_url_requests_a_v4_get_url(gcs_client_with_mock_bucket):
+def test_signed_url_requests_a_v4_get_url(gcs_client_with_mock_bucket):
     client, bucket = gcs_client_with_mock_bucket
     bucket.blob.return_value.generate_signed_url.return_value = "https://signed.example/x"
 
-    url = asyncio.run(client.generate_signed_url("runs/run-1/outputs/scores.csv", 15))
+    url = asyncio.run(
+        client.generate_signed_url_for_uri("gs://cascade-test/runs/run-1/outputs/scores.csv", 15)
+    )
 
     assert url == "https://signed.example/x"
     kwargs = bucket.blob.return_value.generate_signed_url.call_args.kwargs
     assert kwargs["version"] == "v4"
     assert kwargs["method"] == "GET"
     assert kwargs["expiration"].total_seconds() == 900
+    assert kwargs["response_disposition"] is None
 
 
 def test_signed_url_delegates_signing_to_the_iam_api_when_there_is_no_private_key(
@@ -280,7 +272,9 @@ def test_signed_url_delegates_signing_to_the_iam_api_when_there_is_no_private_ke
     client, bucket = gcs_client_with_mock_bucket
     bucket.blob.return_value.generate_signed_url.return_value = "https://signed.example/x"
 
-    asyncio.run(client.generate_signed_url("runs/run-1/outputs/scores.csv", 15))
+    asyncio.run(
+        client.generate_signed_url_for_uri("gs://cascade-test/runs/run-1/outputs/scores.csv", 15)
+    )
 
     kwargs = bucket.blob.return_value.generate_signed_url.call_args.kwargs
     assert kwargs["service_account_email"] == "cascade-run@test-project.iam.gserviceaccount.com"
@@ -318,7 +312,9 @@ def test_signed_url_refreshes_an_expired_metadata_token_before_signing(
     credentials = client._signing_credentials = keyless_metadata_credentials()
     credentials.valid = False
 
-    asyncio.run(client.generate_signed_url("runs/run-1/outputs/scores.csv", 15))
+    asyncio.run(
+        client.generate_signed_url_for_uri("gs://cascade-test/runs/run-1/outputs/scores.csv", 15)
+    )
 
     credentials.refresh.assert_called_once()
 
@@ -331,7 +327,9 @@ def test_signed_url_falls_back_to_local_signing_for_a_non_service_account_identi
     user_credentials.valid = True
     client._signing_credentials = user_credentials
 
-    asyncio.run(client.generate_signed_url("runs/run-1/outputs/scores.csv", 15))
+    asyncio.run(
+        client.generate_signed_url_for_uri("gs://cascade-test/runs/run-1/outputs/scores.csv", 15)
+    )
 
     kwargs = bucket.blob.return_value.generate_signed_url.call_args.kwargs
     assert "service_account_email" not in kwargs

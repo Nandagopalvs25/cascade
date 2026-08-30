@@ -180,17 +180,6 @@ def receptor_atom_count(receptor_pdb: str) -> int:
     return sum(1 for line in receptor_pdb.splitlines() if line.startswith(("ATOM", "HETATM")))
 
 
-def receptor_metal_labels(receptor_pdb: str) -> list[str]:
-    labels: list[str] = []
-    for line in receptor_pdb.splitlines():
-        if not line.startswith("HETATM"):
-            continue
-        label = f"{line[17:20].strip()}:{line[21] or '_'}:{line[22:27].strip()}"
-        if label not in labels:
-            labels.append(label)
-    return labels
-
-
 def find_cocrystal_ligands(pdb_text: str, chain: str | None = None) -> list[HeteroResidue]:
     residues: dict[tuple[str, str, str], HeteroResidue] = {}
     for line in _first_model_lines(pdb_text):

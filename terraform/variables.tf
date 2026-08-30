@@ -9,6 +9,18 @@ variable "region" {
   default     = "us-central1"
 }
 
+variable "gpu_region" {
+  type        = string
+  description = "Region holding the approved Cloud Run NVIDIA L4 quota. GPU workloads deploy here."
+  default     = "europe-west1"
+}
+
+variable "gpu_accelerator_type" {
+  type        = string
+  description = "Cloud Run accelerator attached to GPU workloads."
+  default     = "nvidia-l4"
+}
+
 variable "image" {
   type        = string
   description = "Container image URI for Cloud Run."
@@ -63,4 +75,9 @@ variable "dock_image_digest" {
 variable "admet_image_digest" {
   type        = string
   description = "Digest of the ADMET workload image in the cascade Artifact Registry repo."
+}
+
+variable "md_stability_image_digest" {
+  type        = string
+  description = "Digest of the MD stability workload image in the cascade Artifact Registry repo."
 }

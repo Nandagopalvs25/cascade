@@ -19,7 +19,6 @@ from structure import (  # noqa: E402
     find_cocrystal_ligands,
     receptor_atom_count,
     receptor_chain_ids,
-    receptor_metal_labels,
 )
 
 
@@ -184,7 +183,9 @@ def test_receptor_extraction_keeps_a_catalytic_metal_with_the_protein(structure_
 
     receptor = extract_protein_receptor_pdb(with_zinc)
 
-    assert receptor_metal_labels(receptor) == ["ZN:A:500"]
+    assert [line[17:27] for line in receptor.splitlines() if line.startswith("HETATM")] == [
+        " ZN A 500 "
+    ]
     assert receptor_atom_count(receptor) == 9
     assert "GOL" not in receptor
     assert "HOH" not in receptor

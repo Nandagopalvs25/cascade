@@ -20,9 +20,10 @@ from cascade.agents.schemas import (
     CampaignIntent,
     CardInputs,
     CompoundJudgement,
+    LineageRun,
     PlanRequest,
-    ProposalRequest,
-    StageProposal,
+    StageDecision,
+    StageDecisionRequest,
     TriageRequest,
     TriageVerdict,
     WorkloadPlan,
@@ -34,6 +35,8 @@ from cascade.main import app
 from cascade.models import CardEvent, Decision, Run
 from cascade.schemas import TargetStructure
 from cascade.security import verify_pubsub_oidc
+
+IBUPROFEN_SMILES = "CC(C)Cc1ccc(cc1)C(C)C(=O)O"
 
 INDINAVIR_SMILES = (
     "CC(C)(C)NC(=O)[C@@H]1CN(Cc2cccnc2)CCN1C[C@@H](O)C[C@@H](Cc1ccccc1)C(=O)N[C@H]1c2ccccc2C[C@H]1O"
@@ -67,6 +70,23 @@ async def stub_intake_agent(ctx: Context, node_input: CardInputs) -> CampaignInt
         requested_stages=["dock"],
         ambiguities=[],
         rationale=f"Card {node_input.title!r} names a target and a compound set.",
+    )
+
+
+@node(name="intake")
+async def stub_intake_agent_without_a_control(
+    ctx: Context, node_input: CardInputs
+) -> CampaignIntent:
+    return CampaignIntent(
+        target_name="HIV protease",
+        target_source="rcsb",
+        target_reference="1HSG",
+        ligand_source="smiles_in_text",
+        ligand_reference="card_description",
+        control_compound=None,
+        requested_stages=["dock"],
+        ambiguities=[],
+        rationale="A proposed follow-up card carries only the compounds the parent run promoted.",
     )
 
 
@@ -114,7 +134,7 @@ async def stub_promoting_triage_agent(ctx: Context, node_input: TriageRequest) -
         headline="Two compounds separated from the rest.",
         compounds=[
             CompoundJudgement(
-                compound_id="indinavir", disposition="promote", reason="-11.2 kcal/mol"
+                compound_id="ibuprofen", disposition="promote", reason="-11.2 kcal/mol"
             ),
             CompoundJudgement(compound_id="aspirin", disposition="promote", reason="-8.9 kcal/mol"),
             CompoundJudgement(compound_id="caffeine", disposition="reject", reason="-4.1 kcal/mol"),
@@ -139,23 +159,52 @@ async def stub_untrustworthy_triage_agent(ctx: Context, node_input: TriageReques
     )
 
 
-@node(name="proposer")
-async def stub_proposer_agent(ctx: Context, node_input: ProposalRequest) -> StageProposal:
-    return StageProposal(
-        next_stage=node_input.runnable_next_stages[0],
+def _runnable_stages(node_input: StageDecisionRequest) -> list[str]:
+    return [
+        item.stage
+        for item in node_input.stage_readiness
+        if item.inputs_resolve and item.stage != node_input.completed_stage
+    ]
+
+
+@node(name="stage_decision")
+async def stub_stage_decision_agent(
+    ctx: Context, node_input: StageDecisionRequest
+) -> StageDecision:
+    if node_input.decision_point == "first_stage":
+        requested = node_input.intent.requested_stages
+        chosen = requested[0] if requested else "dock"
+    else:
+        runnable = _runnable_stages(node_input)
+        chosen = runnable[0] if runnable else None
+    return StageDecision(
+        chosen_stage=chosen,
+        question_it_answers="Whether these compounds carry a known liability.",
         card_title=f"Safety screen on {len(node_input.carried_compounds)} compounds",
         reason="No liability data exists for these yet, so screen before spending on simulation.",
-        rationale="Stub proposer picked the only runnable stage.",
+        rationale="Stub decision agent picked the first runnable stage.",
     )
 
 
-@node(name="proposer")
-async def stub_declining_proposer_agent(ctx: Context, node_input: ProposalRequest) -> StageProposal:
-    return StageProposal(
-        next_stage=None,
+@node(name="stage_decision")
+async def stub_declining_stage_decision_agent(
+    ctx: Context, node_input: StageDecisionRequest
+) -> StageDecision:
+    if node_input.decision_point == "first_stage":
+        requested = node_input.intent.requested_stages
+        return StageDecision(
+            chosen_stage=requested[0] if requested else "dock",
+            question_it_answers="Where these compounds sit in the pocket.",
+            card_title="Docking run",
+            reason="Start with docking.",
+            rationale="Stub decision agent started the campaign.",
+        )
+    return StageDecision(
+        chosen_stage=None,
+        question_it_answers="Nothing this stage produced would be answered by another stage.",
         card_title="Nothing to propose",
         reason="Nothing this stage produced would be answered by another stage.",
-        rationale="Stub proposer declined.",
+        rationale="Stub decision agent declined.",
     )
 
 
@@ -258,12 +307,13 @@ def campaign_client(
         patch("cascade.agents.policy.settings", settings_override),
         patch("cascade.agents.nodes.gcs", fake_gcs),
         patch("cascade.agents.nodes.cloud_run_jobs", fake_job_client),
-        patch("cascade.agents.nodes.campaign_inputs", fake_campaign_inputs),
+        patch("cascade.agents.input_resolution.gcs", fake_gcs),
+        patch("cascade.agents.input_resolution.campaign_inputs", fake_campaign_inputs),
         patch("cascade.agents.persistence.async_session", db_sessionmaker),
         patch("cascade.agents.campaign.intake_agent", stub_intake_agent),
         patch("cascade.agents.campaign.planner_agent", stub_planner_agent),
         patch("cascade.agents.campaign.triage_agent", stub_triage_agent),
-        patch("cascade.agents.campaign.proposer_agent", stub_proposer_agent),
+        patch("cascade.agents.campaign.stage_decision_agent", stub_stage_decision_agent),
     ):
         yield TestClient(app)
     app.dependency_overrides.clear()
@@ -482,6 +532,7 @@ async def stub_md_stability_intake_agent(ctx: Context, node_input: CardInputs) -
     )
 
 
+@node(name="intake")
 async def stub_cofold_intake_agent(ctx: Context, node_input: CardInputs) -> CampaignIntent:
     return CampaignIntent(
         target_name="HIV protease",
@@ -495,16 +546,93 @@ async def stub_cofold_intake_agent(ctx: Context, node_input: CardInputs) -> Camp
     )
 
 
-def test_stage_without_a_container_is_refused_before_submission(
+@node(name="intake")
+async def stub_admet_only_intake_agent(ctx: Context, node_input: CardInputs) -> CampaignIntent:
+    return CampaignIntent(
+        target_name=None,
+        target_source=None,
+        target_reference=None,
+        ligand_source="smiles_in_text",
+        ligand_reference="card_description",
+        requested_stages=["admet"],
+        ambiguities=[],
+        rationale="The card asks only for a drug-likeness screen, which needs no protein.",
+    )
+
+
+PARENT_DOCK_RUN_ID = "11111111-2222-3333-4444-555555555555"
+PARENT_ADMET_RUN_ID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+
+MD_CARD_DESCRIPTION = f"""CASCADE proposed this stage from run `{PARENT_ADMET_RUN_ID}`.
+{INDINAVIR_SMILES} indinavir
+Cn1cnc2c1c(=O)n(C)c(=O)n2C caffeine
+"""
+
+
+def docked_pose_sdf(names: tuple[str, ...]) -> str:
+    return "".join(
+        f"{name}\n  fake\n  0  0\nM  END\n"
+        f">  <compound_id>  ({rank}) \n{name}\n\n"
+        f">  <affinity_rank>  ({rank}) \n{rank}\n\n"
+        f">  <best_affinity_kcal_per_mol>  ({rank}) \n-{rank}.5\n\n"
+        "$$$$\n"
+        for rank, name in enumerate(names, start=1)
+    )
+
+
+def test_pose_stability_is_submitted_now_that_it_has_a_cpu_container(
+    campaign_client, fake_trello, fake_gcs, fake_job_client
+):
+    fake_trello.get_card.return_value = {
+        "name": "Re-simulate the surviving poses",
+        "desc": MD_CARD_DESCRIPTION,
+    }
+    fake_gcs.uploaded_bytes[f"runs/{PARENT_DOCK_RUN_ID}/outputs/poses.sdf"] = (
+        docked_pose_sdf(("indinavir", "caffeine")).encode(),
+        "chemical/x-mdl-sdfile",
+    )
+
+    results_prefix = AsyncMock(return_value=f"gs://test-bucket/runs/{PARENT_DOCK_RUN_ID}/outputs")
+    with (
+        patch("cascade.agents.campaign.intake_agent", stub_md_stability_intake_agent),
+        patch("cascade.agents.input_resolution.load_results_prefix_for_run", results_prefix),
+        patch(
+            "cascade.agents.input_resolution.runs_in_lineage",
+            AsyncMock(
+                return_value=[
+                    LineageRun(run_id=PARENT_ADMET_RUN_ID, workload="admet", state="succeeded"),
+                    LineageRun(run_id=PARENT_DOCK_RUN_ID, workload="dock", state="succeeded"),
+                ]
+            ),
+        ),
+    ):
+        response = campaign_client.post("/pubsub/card-events", json=_envelope("card-md", "act-md"))
+
+    assert response.json()["status"] == "started"
+    assert results_prefix.await_args_list[0].args == (PARENT_DOCK_RUN_ID,)
+    fake_job_client.submit_workload_execution.assert_awaited()
+    submitted_spec = fake_job_client.submit_workload_execution.await_args.args[0]
+    run_id = deterministic_run_id("card-md", "md_stability")
+
+    assert submitted_spec.workload == "md_stability"
+    assert submitted_spec.ligands_uri == f"gs://test-bucket/runs/{run_id}/inputs/poses.sdf"
+    assert fake_trello.move_card.await_args.args == ("card-md", "list-in-progress")
+
+    carried, _ = fake_gcs.uploaded_bytes[f"runs/{run_id}/inputs/poses.sdf"]
+    assert carried.decode().count("$$$$") == 2
+
+
+def test_pose_stability_without_a_parent_run_asks_instead_of_submitting(
     campaign_client, fake_trello, fake_job_client
 ):
     with patch("cascade.agents.campaign.intake_agent", stub_md_stability_intake_agent):
         response = campaign_client.post("/pubsub/card-events", json=_envelope("card-md", "act-md"))
 
-    assert response.json()["status"] == "unsupported_executor"
+    assert response.json()["status"] == "needs_clarification"
     fake_job_client.submit_workload_execution.assert_not_awaited()
-    assert "no workload container yet" in _comment_texts(fake_trello)[-1]
-    assert fake_trello.move_card.await_args.args == ("card-md", "list-needs-attention")
+    asked = _comment_texts(fake_trello)[-1]
+    assert "3D coordinates" in asked
+    assert "poses" in asked
 
 
 def test_stage_with_a_container_but_no_gpu_executor_is_refused_before_submission(
@@ -515,7 +643,7 @@ def test_stage_with_a_container_but_no_gpu_executor_is_refused_before_submission
             "/pubsub/card-events", json=_envelope("card-fold", "act-fold")
         )
 
-    assert response.json()["status"] == "unsupported_executor"
+    assert response.json()["status"] == "needs_clarification"
     fake_job_client.submit_workload_execution.assert_not_awaited()
     assert "needs a GPU executor" in _comment_texts(fake_trello)[-1]
     assert fake_trello.move_card.await_args.args == ("card-fold", "list-needs-attention")
@@ -648,8 +776,6 @@ def test_missing_control_compound_stops_before_paying_for_a_docking_run(
 
 
 def test_markdown_mangled_smiles_is_reported_not_silently_dropped():
-    from cascade.agents.compound_library import smiles_library_lines_from_text
-
     mangled = "CC(C)(C)NC(=O)[C@@H ]1CN(Cc2cccnc2)CCN1CC@@HCC@@H indinavir"
     kept, skipped = smiles_library_lines_from_text(mangled)
     assert kept == []
@@ -657,8 +783,6 @@ def test_markdown_mangled_smiles_is_reported_not_silently_dropped():
 
 
 def test_backtick_wrapped_smiles_survives_the_parser():
-    from cascade.agents.compound_library import smiles_library_lines_from_text
-
     kept, skipped = smiles_library_lines_from_text("`CC(=O)Oc1ccccc1C(=O)O` aspirin")
     assert kept == ["CC(=O)Oc1ccccc1C(=O)O\taspirin"]
     assert skipped == 0
@@ -793,7 +917,7 @@ def test_triage_writes_a_row_to_the_decisions_table(campaign_client, db_sessionm
 
     by_agent = {decision.agent: decision for decision in decisions}
 
-    assert set(by_agent) == {"planner", "triage"}
+    assert set(by_agent) == {"planner", "triage", "stage_decision"}
     assert by_agent["planner"].decision_kind == "dock_plan"
     assert by_agent["planner"].rationale
     assert by_agent["planner"].output["params"] is not None
@@ -819,9 +943,57 @@ def test_a_trustworthy_run_with_promoted_hits_creates_a_card_in_recommended(
 
     assert list_id == "list-recommended"
     assert "2 compounds" in title
-    assert INDINAVIR_SMILES in description
+    assert IBUPROFEN_SMILES in description
     assert "caffeine" not in description
     assert fake_trello.move_card.await_args.args == ("card-prop", "list-done")
+
+
+POSES_SDF_TEXT = """ibuprofen
+     RDKit          3D
+
+  1  0  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+>  <compound_id>  (1)
+ibuprofen
+
+$$$$
+aspirin
+     RDKit          3D
+
+  1  0  0  0  0  0  0  0  0  0999 V2000
+    0.0000    0.0000    0.0000 C   0  0  0  0  0  0  0  0  0  0  0  0
+M  END
+>  <compound_id>  (2)
+aspirin
+
+$$$$
+"""
+
+
+def test_a_followup_card_is_still_created_when_the_library_holds_no_inline_smiles(
+    campaign_client, fake_trello, fake_gcs
+):
+    with patch("cascade.agents.campaign.triage_agent", stub_promoting_triage_agent):
+        campaign_client.post("/pubsub/card-events", json=_envelope("card-sdf", "act-sdf"))
+        run_id = deterministic_run_id("card-sdf", "dock")
+        fake_gcs.uploaded_bytes[f"runs/{run_id}/inputs/ligands.smi"] = (
+            POSES_SDF_TEXT.encode(),
+            "chemical/x-mdl-sdfile",
+        )
+        campaign_client.post(
+            "/pubsub/job-completions", json=_completion_envelope(_dock_completion(run_id, 0.83))
+        )
+
+    fake_trello.create_card.assert_awaited_once()
+    description = fake_trello.create_card.await_args.args[2]
+
+    assert "`ibuprofen`" in description
+    assert "`aspirin`" in description
+    assert "caffeine" not in description
+    assert parent_run_id_in_card_description(description) == run_id
+    assert "reads them back" in description
+    assert fake_trello.move_card.await_args.args == ("card-sdf", "list-done")
 
 
 def test_the_recommended_card_is_readable_by_a_fresh_campaign(campaign_client, fake_trello):
@@ -835,7 +1007,7 @@ def test_the_recommended_card_is_readable_by_a_fresh_campaign(campaign_client, f
     description = fake_trello.create_card.await_args.args[2]
     parsed, _ = smiles_library_lines_from_text(description)
 
-    assert [line.split("\t")[1] for line in parsed] == ["indinavir", "aspirin"]
+    assert [line.split("\t")[1] for line in parsed] == ["ibuprofen", "aspirin"]
     assert parent_run_id_in_card_description(description) == run_id
 
 
@@ -850,7 +1022,7 @@ def test_the_original_card_comment_links_the_card_the_agent_created(campaign_cli
     final_comment = _comment_texts(fake_trello)[-1]
 
     assert "Proposed next step: admet" in final_comment
-    assert "`indinavir`, `aspirin`" in final_comment
+    assert "`ibuprofen`, `aspirin`" in final_comment
 
 
 def test_a_run_that_promoted_nothing_completes_without_proposing_a_card(
@@ -883,7 +1055,7 @@ def test_an_untrustworthy_run_proposes_nothing_even_with_promoted_compounds(
 def test_a_proposer_that_declines_creates_no_card_and_says_why(campaign_client, fake_trello):
     with (
         patch("cascade.agents.campaign.triage_agent", stub_promoting_triage_agent),
-        patch("cascade.agents.campaign.proposer_agent", stub_declining_proposer_agent),
+        patch("cascade.agents.campaign.stage_decision_agent", stub_declining_stage_decision_agent),
     ):
         campaign_client.post("/pubsub/card-events", json=_envelope("card-decl", "act-decl"))
         run_id = deterministic_run_id("card-decl", "dock")
@@ -949,7 +1121,8 @@ def test_a_dragged_proposal_card_records_the_docking_run_as_its_parent(
         "name": "Safety screen on 2 compounds",
         "desc": proposed_description,
     }
-    campaign_client.post("/pubsub/card-events", json=_envelope("card-child", "act-child"))
+    with patch("cascade.agents.campaign.intake_agent", stub_intake_agent_without_a_control):
+        campaign_client.post("/pubsub/card-events", json=_envelope("card-child", "act-child"))
 
     async def load_parent_of_child():
         async with db_sessionmaker() as session:
@@ -971,5 +1144,24 @@ def test_the_original_card_says_which_stages_could_not_be_proposed(campaign_clie
 
     final_comment = _comment_texts(fake_trello)[-1]
 
-    assert "`md_stability` - md_stability has no workload container yet" in final_comment
+    assert "`md_stability`" not in final_comment
     assert "`cofold` - cofold needs a GPU executor" in final_comment
+
+
+def test_a_safety_screen_runs_without_a_protein_target(
+    campaign_client, fake_trello, fake_job_client
+):
+    with patch("cascade.agents.campaign.intake_agent", stub_admet_only_intake_agent):
+        response = campaign_client.post(
+            "/pubsub/card-events", json=_envelope("card-admet-only", "act-admet-only")
+        )
+
+    assert response.json()["status"] == "started"
+    fake_job_client.submit_workload_execution.assert_awaited_once()
+    submitted_spec = fake_job_client.submit_workload_execution.await_args.args[0]
+
+    assert submitted_spec.workload == "admet"
+    assert submitted_spec.target is None
+    assert "target" not in submitted_spec.model_dump(exclude_none=True)
+    assert fake_trello.move_card.await_args.args == ("card-admet-only", "list-in-progress")
+    assert not any("protein structure" in comment for comment in _comment_texts(fake_trello))

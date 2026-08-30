@@ -12,7 +12,7 @@ from assessment import (
     predicted_blood_brain_barrier_penetration,
 )
 from compounds import CompoundFailure
-from job_spec import AdmetParams, JobSpec
+from job_spec import AdmetParams, JobSpec, TargetStructure
 
 ASSESSMENTS_FILE_NAME = "admet.csv"
 RESULTS_FILE_NAME = "results.json"
@@ -189,6 +189,16 @@ def _assessment_as_dict(rank: int, assessment: CompoundAssessment) -> dict:
     }
 
 
+def target_provenance(target: TargetStructure | None) -> dict | None:
+    if target is None:
+        return None
+    return {
+        "source": target.source,
+        "reference": target.reference,
+        "pdb_id": target.pdb_id,
+    }
+
+
 def build_run_summary(
     spec: JobSpec,
     params: AdmetParams,
@@ -209,11 +219,7 @@ def build_run_summary(
                 "not trained ADMET regression models"
             ),
         },
-        "target": {
-            "source": spec.target.source,
-            "reference": spec.target.reference,
-            "pdb_id": spec.target.pdb_id,
-        },
+        "target": target_provenance(spec.target),
         "params": params.model_dump(),
         "compounds": {
             "assessed": len(assessments),

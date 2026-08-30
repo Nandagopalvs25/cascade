@@ -5,7 +5,9 @@ import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from docking import LigandDockingResult
+from rdkit import Chem
+
+from docking import LigandDockingResult, PoseConversionError, molecule_from_pose_pdbqt
 from job_spec import BindingSite, DockingParams, JobSpec
 from ligands import LigandFailure
 from score_analysis import (
@@ -19,6 +21,7 @@ SCORES_FILE_NAME = "scores.csv"
 RESULTS_FILE_NAME = "results.json"
 RESULTS_ARCHIVE_NAME = "results.zip"
 POSES_DIRECTORY_NAME = "poses"
+COMBINED_POSES_FILE_NAME = "poses.sdf"
 REFERENCE_LIGAND_FILE_NAME = "reference_ligand.pdb"
 
 UNSAFE_FILE_STEM_CHARACTERS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -106,6 +109,25 @@ def write_best_pose_files(results: list[LigandDockingResult], directory: Path) -
         pose_path = directory / pose_file_relative_path(rank, result.name)
         pose_path.write_text(result.best_pose_pdbqt)
     return poses_directory
+
+
+def write_combined_poses_sdf(results: list[LigandDockingResult], directory: Path) -> Path:
+    destination = directory / COMBINED_POSES_FILE_NAME
+    writer = Chem.SDWriter(str(destination))
+    try:
+        for rank, result in enumerate(rank_results_by_affinity(results), start=1):
+            try:
+                molecule = molecule_from_pose_pdbqt(result.best_pose_pdbqt)
+            except PoseConversionError:
+                continue
+            molecule.SetProp("_Name", result.name)
+            molecule.SetProp("compound_id", result.name)
+            molecule.SetProp("affinity_rank", str(rank))
+            molecule.SetProp("best_affinity_kcal_per_mol", str(result.best_affinity))
+            writer.write(molecule)
+    finally:
+        writer.close()
+    return destination
 
 
 def write_reference_ligand_pdb(pdb_block: str, directory: Path) -> Path:

@@ -2,16 +2,27 @@ from google.cloud import run_v2
 
 from cascade.clients.gcs import GCSClient, run_spec_path
 from cascade.config import Settings
-from cascade.schemas import JobSpec
+from cascade.schemas import GPU_ACCELERATED_WORKLOADS, JobSpec
 
 SPEC_URI_ENVIRONMENT_VARIABLE = "SPEC_URI"
 RUN_ID_ENVIRONMENT_VARIABLE = "RUN_ID"
 
 
+def cloud_run_job_name_for_workload(workload: str) -> str:
+    return f"cascade-{workload.replace('_', '-')}"
+
+
+def cloud_run_region_for_workload(workload: str, settings: Settings) -> str:
+    if workload in GPU_ACCELERATED_WORKLOADS:
+        return settings.gcp_gpu_region
+    return settings.gcp_region
+
+
 def workload_job_resource_name(workload: str, settings: Settings) -> str:
+    region = cloud_run_region_for_workload(workload, settings)
     return (
-        f"projects/{settings.gcp_project_id}/locations/{settings.gcp_region}"
-        f"/jobs/cascade-{workload}"
+        f"projects/{settings.gcp_project_id}/locations/{region}"
+        f"/jobs/{cloud_run_job_name_for_workload(workload)}"
     )
 
 

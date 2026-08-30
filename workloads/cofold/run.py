@@ -8,7 +8,7 @@ from pathlib import Path
 from artifacts import ArtifactStore, publish_job_completion
 from compounds import canonical_smiles, load_compound_library
 from confidence import best_prediction_per_compound, load_complex_predictions
-from job_spec import FoldParams, JobSpec
+from job_spec import FoldParams, JobSpec, require_target_structure
 from protenix_job import (
     ComplexRequest,
     build_protenix_input,
@@ -73,6 +73,7 @@ def resolve_protein_sequence(store: ArtifactStore, spec: JobSpec, params: FoldPa
 
 
 def run_cofold_job(store: ArtifactStore, spec: JobSpec, workspace: Path) -> dict:
+    require_target_structure(spec)
     params = FoldParams.from_job_spec(spec)
     LOGGER.info(
         "run %s: co-folding against %s with protenix model %s",

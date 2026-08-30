@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Workload = Literal["dock", "admet", "md_stability", "cofold"]
 TargetSource = Literal["rcsb", "card_attachment", "url"]
 
+GPU_ACCELERATED_WORKLOADS = frozenset({"md_stability"})
+
 RCSB_ID_PATTERN = re.compile(r"^[0-9][A-Za-z0-9]{3}$")
 
 
@@ -69,7 +71,7 @@ class JobSpec(BaseModel):
 
     run_id: str
     workload: Workload
-    target: TargetStructure
+    target: TargetStructure | None = None
     ligands_uri: str
     binding_site: BindingSite | None = None
     params: dict = Field(default_factory=dict)

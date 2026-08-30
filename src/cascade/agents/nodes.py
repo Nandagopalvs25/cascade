@@ -16,24 +16,23 @@ from cascade.agents.card_text import (
     library_lines_for_compounds,
     planner_decision_lines,
     proposed_card_description,
+    proposed_card_title,
     skipped_lines_note,
     triage_card_comment,
 )
-from cascade.agents.compound_library import (
-    DEFAULT_LIGAND_FILENAME,
-    compound_count_in_library,
-    compound_names_from_library_lines,
-    ligand_filename_for_reference,
-    smiles_library_lines_from_text,
+from cascade.agents.decision_tools import MAXIMUM_CARD_TEXT_CHARACTERS
+from cascade.agents.input_resolution import (
+    input_kinds_available_to_a_campaign,
+    resolve_stage_inputs,
 )
 from cascade.agents.persistence import (
     attach_execution_name_to_job,
     job_interrupt_id,
+    load_lineage_run_summaries,
     load_succeeded_run_for_card,
     record_decision,
     record_job_completion,
     record_run_and_reserve_job_attempt,
-    workloads_already_run_in_lineage,
 )
 from cascade.agents.policy import (
     allowed_job_params_for_workload,
@@ -43,43 +42,46 @@ from cascade.agents.policy import (
     control_check_for_job,
     enforce_control_gate,
     hold_every_scored_compound_when_triage_judged_none,
-    next_stage_options,
+    hold_promotions_when_results_do_not_discriminate,
+    hold_the_control_compound_rather_than_promoting_it,
+    readiness_for_every_stage,
 )
 from cascade.agents.schemas import (
-    BlockedStage,
     CampaignCompletion,
     CampaignIntent,
     CampaignOutcome,
     CampaignState,
     CardInputs,
     CardTrigger,
-    CompletedStage,
     IntakeAnnouncement,
     JobLaunch,
     JobOutcome,
     JobResult,
     JobSubmission,
-    LigandLibrary,
-    LigandRequest,
+    NoStageChosen,
     ProposalDecision,
-    ProposalRequest,
     ProposedFollowup,
+    ResolvedStageInputs,
+    StageDecision,
+    StageDecisionInputs,
+    StageDecisionRecord,
+    StageDecisionRequest,
+    StageInputRequest,
     StageOutcome,
     TriageDecision,
     TriagedJobResult,
     TriageRequest,
     UnsupportedExecutor,
 )
-from cascade.clients import campaign_inputs, cloud_run_jobs, gcs, trello
+from cascade.clients import cloud_run_jobs, gcs, trello
 from cascade.clients.gcs import (
     authenticated_browser_url,
-    run_inputs_prefix,
     run_outputs_prefix,
     run_spec_path,
     storage_console_url,
 )
 from cascade.config import get_settings
-from cascade.schemas import JobSpec, TargetRequest, TargetStructure
+from cascade.schemas import JobSpec
 
 settings = get_settings()
 
@@ -94,15 +96,6 @@ MANIFEST_READ_FAILURES = (
     OSError,
 )
 SIGNING_FAILURES = (AttributeError, GoogleAuthError, google_api_exceptions.GoogleAPICallError)
-
-
-settings = get_settings()
-
-FETCH_RETRY = RetryConfig(max_attempts=3, backoff_factor=2.0, exceptions=[httpx.HTTPError])
-
-SUBMIT_RETRY = RetryConfig(
-    max_attempts=3, backoff_factor=2.0, exceptions=[google_api_exceptions.ServerError]
-)
 
 
 @node(retry_config=FETCH_RETRY, timeout=30.0)
@@ -170,43 +163,11 @@ async def load_campaign_state(ctx: Context, node_input: CardTrigger) -> Campaign
     )
 
 
-@node(retry_config=FETCH_RETRY, timeout=60.0)
-async def prepare_ligand_library(ctx: Context, node_input: LigandRequest) -> LigandLibrary:
-    skipped = 0
-    compound_names: list[str] = []
-    if node_input.source == "smiles_in_text":
-        lines, skipped = smiles_library_lines_from_text(node_input.card_description)
-        if not lines:
-            raise ValueError("no SMILES could be read from the card description")
-        filename = DEFAULT_LIGAND_FILENAME
-        content = ("\n".join(lines) + "\n").encode()
-        compound_names = compound_names_from_library_lines(lines)
-    else:
-        if node_input.source == "attachment":
-            content = await campaign_inputs.download_named_card_attachment(
-                node_input.card_id, node_input.reference
-            )
-        else:
-            content = await campaign_inputs.download_from_url(node_input.reference)
-        if not content.strip():
-            raise ValueError(f"ligand library {node_input.reference!r} was empty")
-        filename = ligand_filename_for_reference(node_input.reference)
-
-    ligands_uri = await gcs.upload_bytes(
-        f"{run_inputs_prefix(node_input.run_id)}/{filename}", content, "text/plain"
-    )
-    return LigandLibrary(
-        ligands_uri=ligands_uri,
-        compound_count=compound_count_in_library(filename, content.decode("utf-8", "replace")),
-        source=node_input.source,
-        compound_names=compound_names,
-        skipped_lines=skipped,
-    )
-
-
-@node(retry_config=FETCH_RETRY, timeout=60.0)
-async def archive_target_structure(ctx: Context, node_input: TargetRequest) -> TargetStructure:
-    return await campaign_inputs.resolve_target_structure(node_input)
+@node(retry_config=FETCH_RETRY, timeout=90.0)
+async def resolve_inputs_for_stage(
+    ctx: Context, node_input: StageInputRequest
+) -> ResolvedStageInputs:
+    return await resolve_stage_inputs(node_input)
 
 
 @node(retry_config=SUBMIT_RETRY, timeout=120.0)
@@ -337,6 +298,8 @@ async def apply_triage_verdict(ctx: Context, node_input: TriageDecision) -> Tria
     request = node_input.request
     verdict = enforce_control_gate(node_input.verdict, request.control, request.attempts_remaining)
     verdict = hold_every_scored_compound_when_triage_judged_none(verdict, request.scores)
+    verdict = hold_the_control_compound_rather_than_promoting_it(verdict, request.control)
+    verdict = hold_promotions_when_results_do_not_discriminate(verdict)
     verdict = verdict.model_copy(
         update={
             "rationale": agent_prose_without_runaway_text(verdict.rationale, verdict.headline),
@@ -351,32 +314,6 @@ async def apply_triage_verdict(ctx: Context, node_input: TriageDecision) -> Tria
         verdict.model_dump(),
     )
     return TriagedJobResult(result=node_input.result, verdict=verdict, control=request.control)
-
-
-@node(timeout=30.0)
-async def build_proposal_request(ctx: Context, node_input: CompletedStage) -> ProposalRequest:
-    verdict = node_input.triaged.verdict
-    completed_stage = node_input.triaged.result.outcome.workload
-    carried, disposition = compounds_carried_to_next_stage(verdict)
-    if not verdict.run_is_trustworthy:
-        runnable: list[str] = []
-        blocked: list[BlockedStage] = []
-    else:
-        already_run = await workloads_already_run_in_lineage(
-            node_input.triaged.result.outcome.run_id
-        )
-        runnable, blocked = next_stage_options(completed_stage, len(carried), already_run)
-    return ProposalRequest(
-        completed_stage=completed_stage,
-        target_name=node_input.target_name,
-        run_is_trustworthy=verdict.run_is_trustworthy,
-        results_discriminate=verdict.results_discriminate,
-        triage_headline=verdict.headline,
-        carried_compounds=carried,
-        carried_disposition=disposition,
-        runnable_next_stages=runnable,
-        blocked_next_stages=blocked,
-    )
 
 
 @node(timeout=60.0)
@@ -406,22 +343,14 @@ async def create_recommended_card(ctx: Context, node_input: ProposalDecision) ->
     except MANIFEST_READ_FAILURES:
         library_text = ""
     library_lines = library_lines_for_compounds(library_text, carried_names)
-    if not library_lines:
-        return ProposedFollowup(
-            note=(
-                f"A {proposal.next_stage} stage is the right next step, but CASCADE could not "
-                f"recover the structures of the carried compounds from "
-                f"`{submission.library.ligands_uri}`, so it did not create a card that the next "
-                f"campaign would be unable to read. Attach the library to a new card instead."
-            ),
-            blocked_note=blocked_note,
-        )
 
     description = proposed_card_description(
         node_input.model_copy(update={"proposal": proposal}), library_lines, submission.run_id
     )
     card = await trello.create_card(
-        settings.trello_list_recommended, proposal.card_title, description
+        settings.trello_list_recommended,
+        proposed_card_title(node_input.completed, proposal.card_title),
+        description,
     )
     followup = ProposedFollowup(
         next_stage=proposal.next_stage,
@@ -539,4 +468,81 @@ async def report_unsupported_executor_on_card(
         campaign_id=node_input.campaign_id,
         card_id=node_input.card_id,
         rationale=node_input.rationale,
+    )
+
+
+@node(retry_config=FETCH_RETRY, timeout=60.0)
+async def build_stage_decision_request(
+    ctx: Context, node_input: StageDecisionInputs
+) -> StageDecisionRequest:
+    completed = node_input.completed
+    anchor_run_id = (
+        completed.triaged.result.outcome.run_id if completed else node_input.parent_run_id
+    )
+    history = await load_lineage_run_summaries(anchor_run_id) if anchor_run_id else []
+    already_run = {entry.workload: entry.run_id for entry in history}
+
+    if completed is not None:
+        carried, disposition = compounds_carried_to_next_stage(completed.triaged.verdict)
+        compound_count = len(carried)
+    else:
+        carried, disposition = [], None
+        compound_count = node_input.intent.expected_compound_count or 0
+
+    available = await input_kinds_available_to_a_campaign(
+        node_input.intent,
+        node_input.attachment_names,
+        anchor_run_id,
+        compound_count,
+    )
+    verdict = completed.triaged.verdict if completed else None
+    return StageDecisionRequest(
+        decision_point=node_input.decision_point,
+        card_title=node_input.card.title,
+        card_description=node_input.card.description[:MAXIMUM_CARD_TEXT_CHARACTERS],
+        intent=node_input.intent,
+        compound_count=compound_count,
+        campaign_history=history,
+        stage_readiness=readiness_for_every_stage(available, compound_count, already_run),
+        completed_stage=completed.triaged.result.outcome.workload if completed else None,
+        completed_run_id=completed.triaged.result.outcome.run_id if completed else None,
+        triage_headline=verdict.headline if verdict else None,
+        run_is_trustworthy=verdict.run_is_trustworthy if verdict else None,
+        results_discriminate=verdict.results_discriminate if verdict else None,
+        carried_compounds=carried,
+        carried_disposition=disposition,
+    )
+
+
+@node(timeout=30.0)
+async def record_stage_choice_in_decision_log(
+    ctx: Context, node_input: StageDecisionRecord
+) -> StageDecision:
+    await record_decision(
+        node_input.run_id,
+        "stage_decision",
+        f"{node_input.request.decision_point}_choice",
+        node_input.decision.rationale,
+        node_input.request.model_dump(exclude_none=True),
+        node_input.decision.model_dump(),
+    )
+    return node_input.decision
+
+
+@node(retry_config=FETCH_RETRY, timeout=30.0)
+async def report_no_stage_chosen_on_card(
+    ctx: Context, node_input: NoStageChosen
+) -> CampaignOutcome:
+    decision = node_input.decision
+    await trello.add_comment(
+        node_input.card_id,
+        f"**CASCADE is not starting a stage on this card.**\n\n"
+        f"{' '.join(decision.question_it_answers.split())}\n\n{decision.rationale}",
+    )
+    await trello.move_card(node_input.card_id, settings.trello_list_needs_attention)
+    return CampaignOutcome(
+        status="needs_attention",
+        campaign_id=node_input.campaign_id,
+        card_id=node_input.card_id,
+        rationale=decision.rationale,
     )

@@ -14,4 +14,6 @@ RUN uv sync --frozen --no-dev
 
 EXPOSE 8080
 
+ENV GOOGLE_GENAI_USE_ENTERPRISE=true
+
 CMD ["sh", "-c", "uv run alembic upgrade head && uv run uvicorn cascade.main:app --host 0.0.0.0 --port 8080"]

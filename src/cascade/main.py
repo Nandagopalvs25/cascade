@@ -6,11 +6,13 @@ from fastapi import FastAPI
 from cascade.agents.runtime import build_campaign_runner
 from cascade.config import get_settings
 from cascade.db import engine
+from cascade.observability import configure_structured_logging
 from cascade.routes import health, pubsub, webhooks
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_structured_logging()
     app.state.runner = build_campaign_runner(get_settings())
     yield
     await engine.dispose()

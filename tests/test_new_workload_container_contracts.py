@@ -24,6 +24,9 @@ SHARED_CONTAINER_MODULE_NAMES = (
     "confidence",
     "protenix_job",
     "sequences",
+    "stability",
+    "poses",
+    "simulation",
 )
 
 
@@ -62,7 +65,7 @@ def service_job_spec(workload: str, params: dict | None = None) -> JobSpec:
     )
 
 
-@pytest.mark.parametrize("workload", ["admet", "cofold"])
+@pytest.mark.parametrize("workload", ["admet", "cofold", "md_stability"])
 def test_service_job_spec_round_trips_through_each_container_parser(workload):
     spec = service_job_spec(workload)
 
@@ -72,7 +75,7 @@ def test_service_job_spec_round_trips_through_each_container_parser(workload):
     assert parsed.model_dump() == spec.model_dump()
 
 
-@pytest.mark.parametrize("workload", ["admet", "cofold"])
+@pytest.mark.parametrize("workload", ["admet", "cofold", "md_stability"])
 def test_each_container_parser_ignores_fields_the_agent_layer_adds_later(workload):
     payload = json.loads(service_job_spec(workload).model_dump_json())
     payload["planner_rationale"] = "cheapest way to triage these"
@@ -85,7 +88,7 @@ def test_each_container_parser_ignores_fields_the_agent_layer_adds_later(workloa
     assert parsed.target.pdb_id == "1M17"
 
 
-@pytest.mark.parametrize("workload", ["admet", "cofold"])
+@pytest.mark.parametrize("workload", ["admet", "cofold", "md_stability"])
 def test_each_container_parser_rejects_a_stage_that_has_no_container(workload):
     payload = json.loads(service_job_spec(workload).model_dump_json())
     payload["workload"] = "synthesis"
@@ -267,3 +270,166 @@ def test_fold_results_refuse_to_present_confidence_as_an_affinity(tmp_path):
     assert "affinity" not in summary["predictions"][0]
     assert control.status == "measured"
     assert control.rank == 1
+
+
+def md_summary_for(
+    stability, name: str, rmsds: list[float], contacts: list[float], rank: int | None = None
+):
+    trajectory = stability.PoseStabilityTrajectory(compound_id=name, affinity_rank=rank)
+    for rmsd, retained in zip(rmsds, contacts, strict=True):
+        trajectory.record_frame(rmsd, retained)
+    return stability.summarize_pose_stability(trajectory, 2.5, 0.6)
+
+
+def test_stability_params_read_the_job_spec_params_and_default_the_rest():
+    spec = service_job_spec("md_stability", {"production_steps": 20000, "max_complexes": 3})
+
+    with container_modules("md_stability", ("job_spec",)) as (job_spec,):
+        parsed = job_spec.JobSpec.model_validate_json(spec.model_dump_json())
+        params = job_spec.StabilityParams.from_job_spec(parsed)
+
+        assert params.production_steps == 20000
+        assert params.max_complexes == 3
+        assert params.temperature_kelvin == 300.0
+        assert params.production_picoseconds == 40.0
+
+
+def test_every_planner_settable_md_param_is_honoured_by_the_container():
+    from cascade.agents.policy import allowed_job_params_for_workload
+
+    with container_modules("md_stability", ("job_spec",)) as (job_spec,):
+        assert allowed_job_params_for_workload("md_stability") <= set(
+            job_spec.StabilityParams.model_fields
+        )
+
+
+def test_md_container_calls_a_pose_that_holds_position_and_contacts_stable():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        summary = md_summary_for(stability, "indinavir", [0.4, 0.6, 0.8], [1.0, 0.95, 0.9])
+
+        assert summary.verdict == "stable"
+        assert summary.final_rmsd_angstrom == 0.8
+
+
+def test_md_container_calls_a_pose_that_moves_but_keeps_contacts_drifted():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        summary = md_summary_for(stability, "ritonavir", [0.5, 2.0, 3.4], [0.9, 0.8, 0.7])
+
+        assert summary.verdict == "drifted"
+        assert "beyond the 2.5 A drift threshold" in " ".join(summary.reasons)
+
+
+def test_md_container_calls_a_pose_that_loses_its_contacts_unstable():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        summary = md_summary_for(stability, "caffeine", [0.6, 5.0, 11.2], [0.9, 0.3, 0.05])
+
+        assert summary.verdict == "unstable"
+        assert "left the pocket" in " ".join(summary.reasons)
+
+
+def test_md_container_does_not_call_a_returning_excursion_drifted():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        summary = md_summary_for(stability, "saquinavir", [0.5, 3.2, 0.9], [0.95, 0.7, 0.92])
+
+        assert summary.verdict == "stable"
+        assert "mobile but not displaced" in " ".join(summary.reasons)
+
+
+def test_md_rmsd_is_measured_in_the_receptor_frame_without_alignment():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        reference = [(0.0, 0.0, 0.0), (1.0, 1.0, 1.0)]
+
+        assert stability.heavy_atom_rmsd_in_receptor_frame(reference, reference) == 0.0
+        assert (
+            stability.heavy_atom_rmsd_in_receptor_frame(
+                reference, [(1.0, 0.0, 0.0), (2.0, 1.0, 1.0)]
+            )
+            == 1.0
+        )
+
+
+def test_md_contacts_are_counted_within_the_cutoff_and_retention_is_a_fraction():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        contacts = stability.receptor_ligand_contacts(
+            [(0.0, 0.0, 0.0), (20.0, 0.0, 0.0)], [(1.0, 0.0, 0.0)], 4.0
+        )
+
+        assert contacts == {(0, 0)}
+        assert (
+            stability.retained_contact_fraction(
+                {(0, 0), (1, 0)}, [(0.0, 0.0, 0.0), (20.0, 0.0, 0.0)], [(1.0, 0.0, 0.0)], 5.5
+            )
+            == 0.5
+        )
+
+
+def test_md_thermal_jitter_past_the_contact_cutoff_does_not_break_a_contact():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        initial = stability.receptor_ligand_contacts([(0.0, 0.0, 0.0)], [(3.9, 0.0, 0.0)], 4.0)
+        assert initial == {(0, 0)}
+
+        jittered = stability.retained_contact_fraction(
+            initial, [(0.0, 0.0, 0.0)], [(4.6, 0.0, 0.0)], 5.5
+        )
+        departed = stability.retained_contact_fraction(
+            initial, [(0.0, 0.0, 0.0)], [(7.0, 0.0, 0.0)], 5.5
+        )
+
+        assert jittered == 1.0
+        assert departed == 0.0
+
+
+def test_md_verdict_uses_sustained_contact_retention_not_one_noisy_final_frame():
+    with container_modules("md_stability", ("stability",)) as (stability,):
+        trajectory = stability.PoseStabilityTrajectory(compound_id="indinavir")
+        for _ in range(9):
+            trajectory.record_frame(1.3, 0.95)
+        trajectory.record_frame(1.36, 0.54)
+
+        summary = stability.summarize_pose_stability(trajectory, 2.5, 0.6)
+
+        assert summary.final_contact_retention == 0.54
+        assert summary.sustained_contact_retention > 0.6
+        assert summary.verdict == "stable"
+
+
+def test_md_results_refuse_to_present_pose_stability_as_an_affinity():
+    spec = service_job_spec("md_stability")
+
+    with container_modules("md_stability", ("job_spec", "stability", "results")) as (
+        job_spec,
+        stability,
+        results,
+    ):
+        parsed = job_spec.JobSpec.model_validate_json(spec.model_dump_json())
+        summaries = [
+            md_summary_for(stability, "erlotinib", [0.4, 0.7], [1.0, 0.92], rank=1),
+            md_summary_for(stability, "caffeine", [0.6, 11.2], [0.9, 0.05], rank=2),
+        ]
+        summary = results.build_run_summary(
+            parsed,
+            job_spec.StabilityParams.from_job_spec(parsed),
+            summaries,
+            [],
+            results.measure_control_compound(parsed, summaries),
+            "CPU",
+        )
+
+        assert summary["verdict_counts"] == {"stable": 1, "drifted": 0, "unstable": 1}
+        assert summary["control_compound"]["verdict"] == "stable"
+        assert summary["stability_analysis"]["most_stable_compound"] == "erlotinib"
+        assert "not a binding free energy" in summary["method"]["caveat"]
+        assert (
+            "must not be read as a predicted affinity" in (summary["stability_analysis"]["caveat"])
+        )
+
+
+def test_triage_reads_the_per_compound_key_the_md_container_writes():
+    from cascade.agents.policy import compound_records_from_manifest
+
+    records = compound_records_from_manifest(
+        "md_stability", {"trajectories": [{"compound_id": "erlotinib", "verdict": "stable"}]}
+    )
+
+    assert records == [{"compound_id": "erlotinib", "verdict": "stable"}]
+    assert compound_records_from_manifest("md_stability", {"scores": [{"compound_id": "x"}]}) == []

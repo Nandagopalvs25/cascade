@@ -46,6 +46,10 @@ class RuleSetOutcome:
     violations: list[str] = field(default_factory=list)
 
 
+def _rule_set_named(rule_sets: list[RuleSetOutcome], name: str) -> RuleSetOutcome:
+    return next(outcome for outcome in rule_sets if outcome.name == name)
+
+
 @dataclass
 class CompoundAssessment:
     name: str
@@ -59,10 +63,7 @@ class CompoundAssessment:
 
     @property
     def lipinski_violation_count(self) -> int:
-        return len(self.rule_set("lipinski").violations)
-
-    def rule_set(self, name: str) -> RuleSetOutcome:
-        return next(outcome for outcome in self.rule_sets if outcome.name == name)
+        return len(_rule_set_named(self.rule_sets, "lipinski").violations)
 
 
 def evaluate_lipinski_rule_of_five(properties: CompoundProperties) -> RuleSetOutcome:
@@ -131,45 +132,78 @@ def predicted_blood_brain_barrier_penetration(properties: CompoundProperties) ->
     return "unlikely"
 
 
-def _decide_verdict(
+def disqualifying_liabilities(
+    alert_counts: dict[str, int],
+    herg: HergRiskAssessment,
+    lipinski: RuleSetOutcome,
+    params: AdmetParams,
+) -> list[str]:
+    return [
+        reason
+        for condition, reason in (
+            (
+                alert_counts.get("pains", 0),
+                f"{alert_counts.get('pains', 0)} PAINS assay-interference alert(s)",
+            ),
+            (
+                alert_counts.get("brenk", 0) >= params.brenk_alerts_that_fail,
+                f"{alert_counts.get('brenk', 0)} Brenk structural alert(s)",
+            ),
+            (herg.band == "high", f"high hERG risk: {herg.reason}"),
+            (
+                len(lipinski.violations) >= params.lipinski_violations_that_fail,
+                f"{len(lipinski.violations)} Lipinski violation(s)",
+            ),
+        )
+        if condition
+    ]
+
+
+def non_disqualifying_concerns(
+    properties: CompoundProperties,
+    alert_counts: dict[str, int],
+    herg: HergRiskAssessment,
+    rule_sets: list[RuleSetOutcome],
+) -> list[str]:
+    lipinski = _rule_set_named(rule_sets, "lipinski")
+    concerns = [
+        reason
+        for condition, reason in (
+            (
+                alert_counts.get("brenk", 0),
+                f"{alert_counts.get('brenk', 0)} Brenk structural alert(s)",
+            ),
+            (alert_counts.get("nih", 0), f"{alert_counts.get('nih', 0)} NIH structural alert(s)"),
+            (herg.band == "moderate", f"moderate hERG risk: {herg.reason}"),
+            (lipinski.violations, f"{len(lipinski.violations)} Lipinski violation(s)"),
+        )
+        if condition
+    ]
+    concerns += [
+        f"{outcome.name} violation(s): {', '.join(outcome.violations)}"
+        for outcome in rule_sets
+        if outcome.name != "lipinski" and not outcome.passed
+    ]
+    if properties.drug_likeness_qed < LOW_DRUG_LIKENESS_QED:
+        concerns.append(f"low drug-likeness QED {properties.drug_likeness_qed}")
+    if properties.synthetic_accessibility > HIGH_SYNTHETIC_ACCESSIBILITY:
+        concerns.append(f"high synthetic accessibility score {properties.synthetic_accessibility}")
+    return concerns
+
+
+def verdict_for_compound(
     properties: CompoundProperties,
     alert_counts: dict[str, int],
     herg: HergRiskAssessment,
     rule_sets: list[RuleSetOutcome],
     params: AdmetParams,
 ) -> tuple[str, list[str]]:
-    lipinski = next(outcome for outcome in rule_sets if outcome.name == "lipinski")
-    blocking: list[str] = []
-    concerns: list[str] = []
-
-    if alert_counts.get("pains", 0):
-        blocking.append(f"{alert_counts['pains']} PAINS assay-interference alert(s)")
-    if alert_counts.get("brenk", 0) >= params.brenk_alerts_that_fail:
-        blocking.append(f"{alert_counts['brenk']} Brenk structural alert(s)")
-    if herg.band == "high":
-        blocking.append(f"high hERG risk: {herg.reason}")
-    if len(lipinski.violations) >= params.lipinski_violations_that_fail:
-        blocking.append(f"{len(lipinski.violations)} Lipinski violation(s)")
-
+    blocking = disqualifying_liabilities(
+        alert_counts, herg, _rule_set_named(rule_sets, "lipinski"), params
+    )
     if blocking:
         return VERDICT_FAIL, blocking
-
-    if alert_counts.get("brenk", 0):
-        concerns.append(f"{alert_counts['brenk']} Brenk structural alert(s)")
-    if alert_counts.get("nih", 0):
-        concerns.append(f"{alert_counts['nih']} NIH structural alert(s)")
-    if herg.band == "moderate":
-        concerns.append(f"moderate hERG risk: {herg.reason}")
-    if lipinski.violations:
-        concerns.append(f"{len(lipinski.violations)} Lipinski violation(s)")
-    for outcome in rule_sets:
-        if outcome.name != "lipinski" and not outcome.passed:
-            concerns.append(f"{outcome.name} violation(s): {', '.join(outcome.violations)}")
-    if properties.drug_likeness_qed < LOW_DRUG_LIKENESS_QED:
-        concerns.append(f"low drug-likeness QED {properties.drug_likeness_qed}")
-    if properties.synthetic_accessibility > HIGH_SYNTHETIC_ACCESSIBILITY:
-        concerns.append(f"high synthetic accessibility score {properties.synthetic_accessibility}")
-
+    concerns = non_disqualifying_concerns(properties, alert_counts, herg, rule_sets)
     if concerns:
         return VERDICT_FLAG, concerns
     return VERDICT_PASS, ["no liabilities detected by the configured filters"]
@@ -188,7 +222,7 @@ def assess_compound(name: str, mol: Chem.Mol, params: AdmetParams) -> CompoundAs
         evaluate_egan_absorption(properties),
         evaluate_ghose_drug_likeness(properties),
     ]
-    verdict, reasons = _decide_verdict(properties, alert_counts, herg, rule_sets, params)
+    verdict, reasons = verdict_for_compound(properties, alert_counts, herg, rule_sets, params)
     return CompoundAssessment(
         name=name,
         smiles=Chem.MolToSmiles(mol),

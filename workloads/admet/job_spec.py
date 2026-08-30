@@ -32,7 +32,7 @@ class JobSpec(BaseModel):
 
     run_id: str
     workload: Workload
-    target: TargetStructure
+    target: TargetStructure | None = None
     ligands_uri: str
     binding_site: BindingSite | None = None
     params: dict = Field(default_factory=dict)

@@ -6,10 +6,13 @@ from cascade.agents.card_text import (
 )
 from cascade.agents.policy import (
     attempts_remaining_after,
+    compounds_carried_to_next_stage,
     control_check_for_job,
     enforce_control_gate,
-    escalated_docking_params,
     hold_every_scored_compound_when_triage_judged_none,
+    hold_promotions_when_results_do_not_discriminate,
+    hold_the_control_compound_rather_than_promoting_it,
+    plan_escalated_after_control_failure,
 )
 from cascade.agents.schemas import (
     CompoundJudgement,
@@ -216,7 +219,15 @@ def test_attempts_remaining_runs_out_at_the_configured_ceiling():
 
 
 def test_a_rerun_raises_conformer_count_rather_than_search_effort():
-    escalated = escalated_docking_params(WorkloadParams(exhaustiveness=8, num_modes=9))
+    plan = WorkloadPlan(
+        workload="dock",
+        binding_site_method="co_crystal",
+        binding_site_confidence="high",
+        params=WorkloadParams(exhaustiveness=8, num_modes=9),
+        rationale="Eight-fold search is enough for this pocket.",
+    )
+
+    escalated = plan_escalated_after_control_failure(plan).params
 
     assert escalated.conformers_per_ligand == 8
     assert escalated.exhaustiveness == 8
@@ -268,7 +279,6 @@ def test_the_rmsd_threshold_is_configurable():
         gcp_project_id="p",
         gcs_bucket="b",
         pubsub_card_events_topic="t",
-        pubsub_job_completions_topic="t",
         trello_api_key="k",
         trello_api_token="t",
         trello_api_secret="s",
@@ -414,7 +424,6 @@ def test_the_submission_comment_shows_what_the_agent_decided():
 
 def test_a_rerun_comment_never_repeats_the_superseded_rationale():
     from cascade.agents.card_text import planner_decision_lines
-    from cascade.agents.policy import plan_escalated_after_control_failure
 
     plan = WorkloadPlan(
         workload="dock",
@@ -447,3 +456,97 @@ def test_settings_from_another_stage_never_reach_the_card():
     assert "exhaustiveness" not in comment
     assert "`max_compounds`: 500" in comment
     assert "Binding site" not in comment
+
+
+def _verdict_with(compounds, results_discriminate=True):
+    return TriageVerdict(
+        run_is_trustworthy=True,
+        results_discriminate=results_discriminate,
+        next_action="complete",
+        headline="Docking ran.",
+        compounds=compounds,
+        rationale="Stub rationale.",
+    )
+
+
+def _measured_control(name="indinavir"):
+    return ControlCheck(
+        verdict="passed",
+        compound_name=name,
+        status="measured",
+        top_pose_rmsd_angstrom=0.682,
+        threshold_angstrom=2.0,
+        detail="within threshold",
+    )
+
+
+def test_the_control_compound_is_held_rather_than_promoted_as_a_hit():
+    verdict = _verdict_with(
+        [
+            CompoundJudgement(
+                compound_id="indinavir", disposition="promote", reason="control reproduced its pose"
+            ),
+            CompoundJudgement(compound_id="saquinavir", disposition="hold", reason="within error"),
+        ]
+    )
+
+    held = hold_the_control_compound_rather_than_promoting_it(verdict, _measured_control())
+    by_id = {judgement.compound_id: judgement for judgement in held.compounds}
+
+    assert by_id["indinavir"].disposition == "hold"
+    assert "control reference" in by_id["indinavir"].reason
+    assert by_id["saquinavir"].disposition == "hold"
+
+
+def test_holding_the_control_stops_it_being_the_only_compound_carried_forward():
+    verdict = _verdict_with(
+        [
+            CompoundJudgement(compound_id="indinavir", disposition="promote", reason="control"),
+            CompoundJudgement(compound_id="saquinavir", disposition="hold", reason="within error"),
+            CompoundJudgement(compound_id="nelfinavir", disposition="hold", reason="within error"),
+        ]
+    )
+
+    held = hold_the_control_compound_rather_than_promoting_it(verdict, _measured_control())
+    carried, disposition = compounds_carried_to_next_stage(held)
+
+    assert disposition == "hold"
+    assert sorted(judgement.compound_id for judgement in carried) == [
+        "indinavir",
+        "nelfinavir",
+        "saquinavir",
+    ]
+
+
+def test_nothing_is_promoted_when_the_run_did_not_separate_the_compounds():
+    verdict = _verdict_with(
+        [
+            CompoundJudgement(compound_id="saquinavir", disposition="promote", reason="-11.3"),
+            CompoundJudgement(compound_id="caffeine", disposition="reject", reason="-5.5"),
+        ],
+        results_discriminate=False,
+    )
+
+    downgraded = hold_promotions_when_results_do_not_discriminate(verdict)
+    by_id = {judgement.compound_id: judgement for judgement in downgraded.compounds}
+
+    assert by_id["saquinavir"].disposition == "hold"
+    assert "did not separate" in by_id["saquinavir"].reason
+    assert by_id["caffeine"].disposition == "reject"
+
+
+def test_a_discriminating_run_keeps_its_promotions():
+    verdict = _verdict_with(
+        [CompoundJudgement(compound_id="saquinavir", disposition="promote", reason="-11.3")]
+    )
+
+    assert hold_promotions_when_results_do_not_discriminate(verdict) == verdict
+
+
+def test_a_run_without_a_control_is_left_alone():
+    verdict = _verdict_with(
+        [CompoundJudgement(compound_id="saquinavir", disposition="promote", reason="-11.3")]
+    )
+    control = ControlCheck(verdict="not_measured", detail="no control requested")
+
+    assert hold_the_control_compound_rather_than_promoting_it(verdict, control) == verdict

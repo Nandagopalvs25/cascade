@@ -1,17 +1,31 @@
 import uuid
 from typing import get_args
 
+from cascade.agents.capabilities import (
+    InputKind,
+    required_inputs_for_stage,
+    unmet_inputs_for_stage,
+    unmet_requirement_question,
+)
 from cascade.agents.schemas import (
     BlockedStage,
+    CampaignIntent,
+    CompletedStage,
     CompoundJudgement,
     ControlCheck,
+    ProposalDecision,
+    ProposalRequest,
+    StageDecision,
+    StageDecisionRequest,
+    StageInputReadiness,
+    StageInputStatus,
+    StageProposal,
     TriageDisposition,
     TriageVerdict,
-    WorkloadParams,
     WorkloadPlan,
 )
 from cascade.config import get_settings
-from cascade.schemas import Workload
+from cascade.schemas import GPU_ACCELERATED_WORKLOADS, Workload
 
 settings = get_settings()
 
@@ -53,12 +67,27 @@ ALLOWED_JOB_PARAMS_BY_WORKLOAD = {
             "protein_sequence",
         }
     ),
-    "md_stability": frozenset(),
+    "md_stability": frozenset(
+        {
+            "max_complexes",
+            "equilibration_steps",
+            "production_steps",
+            "timestep_femtoseconds",
+            "temperature_kelvin",
+            "frames_recorded",
+            "minimization_max_iterations",
+            "pose_drift_threshold_angstrom",
+            "contact_retention_threshold",
+            "contact_cutoff_angstrom",
+            "contact_break_cutoff_angstrom",
+        }
+    ),
 }
 
-GPU_WORKLOADS = frozenset({"md_stability", "cofold"})
+WORKLOADS_NEEDING_AN_UNBUILT_GPU_EXECUTOR = frozenset({"cofold"})
+CLOUD_RUN_EXECUTORS = frozenset({"cloud_run_job", "cloud_run_gpu_job"})
 
-IMPLEMENTED_WORKLOADS = frozenset({"dock", "admet", "cofold"})
+IMPLEMENTED_WORKLOADS = frozenset({"dock", "admet", "cofold", "md_stability"})
 
 
 def allowed_job_params_for_workload(workload: str) -> frozenset[str]:
@@ -69,6 +98,7 @@ COMPOUND_RECORD_KEY_BY_WORKLOAD = {
     "dock": "scores",
     "admet": "assessments",
     "cofold": "predictions",
+    "md_stability": "trajectories",
 }
 
 
@@ -80,8 +110,13 @@ def compound_records_from_manifest(workload: str, manifest: dict) -> list[dict]:
 
 
 def executor_for_workload(workload: str, compound_count: int) -> str:
-    if workload in GPU_WORKLOADS or compound_count > settings.max_ligands_per_cloud_run_job:
+    if (
+        workload in WORKLOADS_NEEDING_AN_UNBUILT_GPU_EXECUTOR
+        or compound_count > settings.max_ligands_per_cloud_run_job
+    ):
         return "cloud_batch"
+    if workload in GPU_ACCELERATED_WORKLOADS:
+        return "cloud_run_gpu_job"
     return "cloud_run_job"
 
 
@@ -91,12 +126,13 @@ def unsupported_stage_rationale(workload: str, compound_count: int) -> str | Non
             f"{workload} has no workload container yet, so CASCADE cannot run this stage. "
             f"Only {', '.join(sorted(IMPLEMENTED_WORKLOADS))} have containers."
         )
-    if workload in GPU_WORKLOADS:
+    if workload in WORKLOADS_NEEDING_AN_UNBUILT_GPU_EXECUTOR:
         return (
-            f"{workload} needs a GPU executor. Its container is built, but CASCADE only submits "
-            f"to Cloud Run Jobs today and GPU submission is not wired up yet."
+            f"{workload} needs a GPU executor. Its container is built, but the project's single "
+            f"L4 GPU allocation is committed to the md_stability Cloud Run Job and Cloud Batch "
+            f"submission is not wired up yet."
         )
-    if executor_for_workload(workload, compound_count) != "cloud_run_job":
+    if executor_for_workload(workload, compound_count) not in CLOUD_RUN_EXECUTORS:
         return (
             f"{compound_count} compounds exceeds the "
             f"{settings.max_ligands_per_cloud_run_job}-ligand Cloud Run Job ceiling, and "
@@ -195,21 +231,15 @@ def attempts_remaining_after(attempt: int) -> int:
     return max(settings.max_job_attempts - attempt, 0)
 
 
-def escalated_docking_params(params: WorkloadParams) -> WorkloadParams:
-    return params.model_copy(
-        update={"conformers_per_ligand": settings.control_rerun_conformers_per_ligand}
-    )
-
-
 def plan_escalated_after_control_failure(plan: WorkloadPlan) -> WorkloadPlan:
-    escalated = escalated_docking_params(plan.params)
+    conformers = settings.control_rerun_conformers_per_ligand
     return plan.model_copy(
         update={
-            "params": escalated,
+            "params": plan.params.model_copy(update={"conformers_per_ligand": conformers}),
             "rationale": (
                 "The control compound did not reproduce its crystallographic pose, so the "
                 "starting geometry is the suspect rather than the search. CASCADE raised "
-                f"conformers_per_ligand to {escalated.conformers_per_ligand} and is re-running "
+                f"conformers_per_ligand to {conformers} and is re-running "
                 "the same compounds against the same pocket. This escalation is enforced in "
                 "code, not chosen by the model."
             ),
@@ -271,6 +301,59 @@ def hold_every_scored_compound_when_triage_judged_none(
     return verdict.model_copy(update={"compounds": held})
 
 
+def hold_the_control_compound_rather_than_promoting_it(
+    verdict: TriageVerdict, control: ControlCheck
+) -> TriageVerdict:
+    if control.compound_name is None or not verdict.compounds:
+        return verdict
+    control_name = control.compound_name.casefold()
+    return verdict.model_copy(
+        update={
+            "compounds": [
+                judgement
+                if judgement.disposition != "promote"
+                or judgement.compound_id.casefold() != control_name
+                else judgement.model_copy(
+                    update={
+                        "disposition": "hold",
+                        "reason": (
+                            f"{judgement.reason.rstrip()} Carried as the control reference rather "
+                            f"than promoted: a control establishes whether the method reproduces a "
+                            f"pose it is known to get right, so its own result is not a finding "
+                            f"this run produced."
+                        ),
+                    }
+                )
+                for judgement in verdict.compounds
+            ]
+        }
+    )
+
+
+def hold_promotions_when_results_do_not_discriminate(verdict: TriageVerdict) -> TriageVerdict:
+    if verdict.results_discriminate or not verdict.compounds:
+        return verdict
+    return verdict.model_copy(
+        update={
+            "compounds": [
+                judgement
+                if judgement.disposition != "promote"
+                else judgement.model_copy(
+                    update={
+                        "disposition": "hold",
+                        "reason": (
+                            f"{judgement.reason.rstrip()} Held rather than promoted because this "
+                            f"run did not separate the compounds from one another, so no compound "
+                            f"in it is distinguishable as a hit."
+                        ),
+                    }
+                )
+                for judgement in verdict.compounds
+            ]
+        }
+    )
+
+
 def compounds_carried_to_next_stage(
     verdict: TriageVerdict,
 ) -> tuple[list[CompoundJudgement], TriageDisposition]:
@@ -280,30 +363,132 @@ def compounds_carried_to_next_stage(
     return [judgement for judgement in verdict.compounds if judgement.disposition == "hold"], "hold"
 
 
-def already_run_stage_rationale(candidate: str, already_run: dict[str, str]) -> str | None:
-    previous_run_id = already_run.get(candidate)
-    if previous_run_id is None:
-        return None
-    return (
-        f"{candidate} already ran on these compounds in run `{previous_run_id}`, so re-running it "
-        "on the same inputs repeats work already done rather than adding information."
+def stage_input_readiness(
+    stage: str,
+    available_inputs: frozenset[InputKind],
+    compound_count: int,
+    already_run: dict[str, str],
+) -> StageInputReadiness:
+    unmet = sorted(unmet_inputs_for_stage(stage, available_inputs))
+    statuses = [
+        StageInputStatus(kind=kind, resolves=kind not in unmet)
+        for kind in sorted(required_inputs_for_stage(stage))
+    ]
+    blocking_reason = (
+        unmet_requirement_question(unmet[0], stage)
+        if unmet
+        else unsupported_stage_rationale(stage, compound_count)
+    )
+    return StageInputReadiness(
+        stage=stage,
+        inputs_resolve=blocking_reason is None,
+        inputs=statuses,
+        blocking_reason=blocking_reason,
+        already_run_as=already_run.get(stage),
     )
 
 
-def next_stage_options(
-    completed_stage: str, compound_count: int, already_run: dict[str, str] | None = None
-) -> tuple[list[str], list[BlockedStage]]:
+def readiness_for_every_stage(
+    available_inputs: frozenset[InputKind],
+    compound_count: int,
+    already_run: dict[str, str] | None = None,
+) -> list[StageInputReadiness]:
     already_run = already_run or {}
-    runnable: list[str] = []
-    blocked: list[BlockedStage] = []
-    for candidate in get_args(Workload):
-        if candidate == completed_stage:
-            continue
-        reason = already_run_stage_rationale(candidate, already_run) or unsupported_stage_rationale(
-            candidate, compound_count
+    return [
+        stage_input_readiness(stage, available_inputs, compound_count, already_run)
+        for stage in get_args(Workload)
+    ]
+
+
+def stage_choice_rejection_reason(
+    decision: StageDecision, request: StageDecisionRequest
+) -> str | None:
+    if decision.chosen_stage is None:
+        return None
+    readiness = {item.stage: item for item in request.stage_readiness}
+    chosen = readiness.get(decision.chosen_stage)
+    if chosen is None:
+        return (
+            f"{decision.chosen_stage} is not a stage CASCADE has a workload container for. "
+            f"The stages it can run are {', '.join(sorted(readiness))}."
         )
-        if reason is None:
-            runnable.append(candidate)
-        else:
-            blocked.append(BlockedStage(workload=candidate, reason=reason))
-    return runnable, blocked
+    if not chosen.inputs_resolve:
+        return chosen.blocking_reason or (
+            f"{decision.chosen_stage} cannot run because an input it needs does not resolve."
+        )
+    if request.run_is_trustworthy is False:
+        return (
+            f"The {request.completed_stage} run was not judged trustworthy, so nothing may be "
+            f"built on top of it. Choose nothing."
+        )
+    if request.decision_point == "next_stage" and not request.carried_compounds:
+        return (
+            f"No compound survived the {request.completed_stage} stage, so "
+            f"{decision.chosen_stage} would have nothing to run on. Choose nothing."
+        )
+    return None
+
+
+def blocked_stages_from_readiness(
+    readiness: list[StageInputReadiness], chosen_stage: str | None
+) -> list[BlockedStage]:
+    return [
+        BlockedStage(
+            workload=item.stage,
+            reason=item.blocking_reason or "its inputs do not resolve",
+        )
+        for item in readiness
+        if not item.inputs_resolve and item.stage != chosen_stage
+    ]
+
+
+def runnable_stages_from_readiness(
+    readiness: list[StageInputReadiness], completed_stage: str | None
+) -> list[str]:
+    return [
+        item.stage for item in readiness if item.inputs_resolve and item.stage != completed_stage
+    ]
+
+
+def proposal_decision_from_stage_decision(
+    completed: CompletedStage, request: StageDecisionRequest, decision: StageDecision
+) -> ProposalDecision:
+    verdict = completed.triaged.verdict
+    completed_stage = completed.triaged.result.outcome.workload
+    proposal_request = ProposalRequest(
+        completed_stage=completed_stage,
+        target_name=completed.target_name,
+        run_is_trustworthy=verdict.run_is_trustworthy,
+        results_discriminate=verdict.results_discriminate,
+        triage_headline=verdict.headline,
+        carried_compounds=request.carried_compounds,
+        carried_disposition=request.carried_disposition or "hold",
+        runnable_next_stages=runnable_stages_from_readiness(
+            request.stage_readiness, completed_stage
+        ),
+        blocked_next_stages=blocked_stages_from_readiness(
+            request.stage_readiness, decision.chosen_stage
+        ),
+    )
+    return ProposalDecision(
+        completed=completed,
+        request=proposal_request,
+        proposal=StageProposal(
+            next_stage=decision.chosen_stage,
+            card_title=decision.card_title,
+            reason=decision.reason,
+            rationale=decision.rationale,
+        ),
+    )
+
+
+def stage_blocking_reasons_for_requested_stages(
+    intent: CampaignIntent, request: StageDecisionRequest
+) -> list[str]:
+    readiness = {item.stage: item for item in request.stage_readiness}
+    reasons = [
+        readiness[stage].blocking_reason
+        for stage in intent.requested_stages
+        if stage in readiness and not readiness[stage].inputs_resolve
+    ]
+    return [reason for reason in reasons if reason]
